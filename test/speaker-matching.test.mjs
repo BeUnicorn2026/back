@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   chooseKnownSpeaker, diarizedAudioRegions, SpeakerIdentityTracker, wordsToSegments, wordsToTranscriptSegments
 } from "../lib/speaker-matching.mjs";
-import { cosineSimilarity, mergeSpeakerProfileVectors, pcmRms } from "../lib/speaker-embedding-model.mjs";
+import { assessSpeakerProfileExtension, cosineSimilarity, mergeSpeakerProfileVectors, pcmRms } from "../lib/speaker-embedding-model.mjs";
 
 const speakers = [{ id: "one", name: "민수" }, { id: "two", name: "지수" }];
 
@@ -110,6 +110,16 @@ test("merges and deduplicates speaker profiles across enrollment sessions", () =
   assert.equal(result.vectors.length, 4);
   assert.ok(result.consistency > 0.9);
   assert.ok(result.matchThreshold >= 0.68 && result.matchThreshold <= 0.82);
+});
+
+test("accepts matching enrollment extensions and rejects another registered speaker", () => {
+  const target = { id: "one", name: "민수", matchThreshold: 0.72, profiles: [new Float32Array([1, 0])] };
+  const other = { id: "two", name: "지수", profiles: [new Float32Array([0, 1])] };
+  const accepted = assessSpeakerProfileExtension(target, [new Float32Array([0.98, 0.1])], [other]);
+  assert.equal(accepted.accepted, true);
+  const rejected = assessSpeakerProfileExtension(target, [new Float32Array([0.05, 0.99])], [other]);
+  assert.equal(rejected.accepted, false);
+  assert.match(rejected.reason, /지수|일치하지 않습니다/);
 });
 
 test("creates a speaker-free segment for isolated STT testing", () => {

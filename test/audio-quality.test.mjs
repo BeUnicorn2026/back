@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { analyzePcmQuality } from "../lib/audio-quality.mjs";
+import { analyzePcmQuality, isSpeakerInferenceQuality } from "../lib/audio-quality.mjs";
 
 function makePcm({ seconds = 6, amplitude = 5_000, voicedRatio = 0.6 } = {}) {
   const samples = new Int16Array(seconds * 16_000);
@@ -30,4 +30,12 @@ test("detects clipping", () => {
   const quality = analyzePcmQuality(pcm);
   assert.ok(quality.clippingRatio > 0.005);
   assert.ok(quality.warnings.some((warning) => warning.includes("찌그러질")));
+});
+
+test("gates short speaker inference without applying the five second enrollment rule", () => {
+  const pcm = makePcm({ seconds: 2 });
+  const quality = analyzePcmQuality(pcm);
+  assert.equal(quality.usable, false);
+  assert.equal(isSpeakerInferenceQuality(quality), true);
+  assert.equal(isSpeakerInferenceQuality(analyzePcmQuality(new Int16Array(32_000))), false);
 });

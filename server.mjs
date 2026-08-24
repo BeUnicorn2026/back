@@ -7,9 +7,9 @@ import express from "express";
 import multer from "multer";
 import WebSocket, { WebSocketServer } from "ws";
 import { AuthError, AuthStore } from "./lib/auth-store.mjs";
-import { analyzePcmQuality } from "./lib/audio-quality.mjs";
+import { analyzePcmQuality, isSpeakerInferenceQuality } from "./lib/audio-quality.mjs";
 import { normalizeTranscript } from "./lib/normalize-transcript.mjs";
-import { getSpeakerEmbeddingModel, mergeSpeakerProfileVectors, speakerModelInfo } from "./lib/speaker-embedding-model.mjs";
+import { assessSpeakerProfileExtension, getSpeakerEmbeddingModel, mergeSpeakerProfileVectors, speakerModelInfo } from "./lib/speaker-embedding-model.mjs";
 import { diarizedAudioRegions, SpeakerIdentityTracker, wordsToSegments, wordsToTranscriptSegments } from "./lib/speaker-matching.mjs";
 import { SpeakerStore } from "./lib/speaker-store.mjs";
 import { MeetingStore } from "./lib/meeting-store.mjs";
@@ -569,7 +569,8 @@ app.post("/api/speakers/:id/samples", requireTrustedOrigin, requireAuth, require
   if (!/^[a-f0-9-]{36}$/i.test(request.params.id)) return response.status(400).json({ error: "잘못된 화자 ID입니다." });
   if (!request.file) return response.status(400).json({ error: "MP3 또는 WAV 추가 음성이 필요합니다." });
   try {
-    const existing = (await speakerStore.loadProfiles(request.auth.organization.id)).find(({ id }) => id === request.params.id);
+    const registeredSpeakers = await speakerStore.loadProfiles(request.auth.organization.id);
+    const existing = registeredSpeakers.find(({ id }) => id === request.params.id);
     if (!existing) return response.status(404).json({ error: "등록된 목소리를 찾지 못했습니다." });
     if ((existing.enrollmentSessionCount || 1) >= 8) return response.status(409).json({ error: "한 사람당 최대 8회까지 음성을 추가할 수 있습니다." });
     const pcm = await decodeToPcm(request.file.buffer);
@@ -578,7 +579,14 @@ app.post("/api/speakers/:id/samples", requireTrustedOrigin, requireAuth, require
     const quality = analyzePcmQuality(new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2)));
     if (!quality.usable) return response.status(422).json({ error: quality.warnings[0] || "추가 음성 품질이 충분하지 않습니다.", quality });
     const additional = await enrollProfile(pcm);
+    const extension = assessSpeakerProfileExtension(
+      existing,
+      additional.vectors,
+      registeredSpeakers.filter(({ id }) => id !== existing.id)
+    );
+    if (!extension.accepted) return response.status(422).json({ error: extension.reason, comparison: extension });
     const merged = mergeSpeakerProfileVectors([existing.profiles, additional.vectors], { maximumProfiles: 32 });
+    if (merged.consistency < 0.58) return response.status(422).json({ error: "추가 후 목소리 특성의 일관성이 너무 낮아 저장하지 않았습니다." });
     const profileBuffer = Buffer.concat(merged.vectors.map((vector) => Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength)));
     const now = new Date().toISOString();
     const updated = {
@@ -590,6 +598,8 @@ app.post("/api/speakers/:id/samples", requireTrustedOrigin, requireAuth, require
       totalEnrollmentDuration: (existing.totalEnrollmentDuration || existing.duration || 0) + duration,
       lastEnrolledAt: now,
       latestAudioQuality: quality,
+      latestEnrollmentAffinity: extension.targetAffinity,
+      nearestOtherSpeakerAffinity: extension.nearestOther?.affinity ?? null,
       enrollmentSessions: [...(existing.enrollmentSessions || []), { duration, qualityScore: quality.score, enrolledAt: now }].slice(-8)
     };
     delete updated.profile;
@@ -748,13 +758,16 @@ liveServer.on("connection", async (client, request, requestUrl) => {
         const snapshot = Buffer.from(audioHistory.subarray(firstByte, lastByte));
         try {
           const pcm = new Int16Array(snapshot.buffer, snapshot.byteOffset, snapshot.byteLength / 2);
+          const inferenceQuality = analyzePcmQuality(pcm, speakerModelInfo.sampleRate);
+          if (!isSpeakerInferenceQuality(inferenceQuality)) continue;
           const scores = await speakerModel.compare(pcm, profiles);
           if (scores) {
             recognitionFrames.push({
               start: region.start,
               end: region.end,
               sourceSpeaker: region.sourceSpeaker,
-              weight: Math.min(8, region.end - region.start),
+              weight: Math.min(8, region.end - region.start) * Math.max(0.5, Math.min(1, inferenceQuality.snrDb / 20)),
+              qualityScore: inferenceQuality.score,
               scores
             });
             analyzedRegions.add(cacheKey);
