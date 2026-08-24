@@ -1,0 +1,871 @@
+import "dotenv/config";
+import { randomUUID, timingSafeEqual } from "node:crypto";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import express from "express";
+import multer from "multer";
+import WebSocket, { WebSocketServer } from "ws";
+import { AuthError, AuthStore } from "./lib/auth-store.mjs";
+import { analyzePcmQuality } from "./lib/audio-quality.mjs";
+import { normalizeTranscript } from "./lib/normalize-transcript.mjs";
+import { getSpeakerEmbeddingModel, mergeSpeakerProfileVectors, speakerModelInfo } from "./lib/speaker-embedding-model.mjs";
+import { diarizedAudioRegions, SpeakerIdentityTracker, wordsToSegments, wordsToTranscriptSegments } from "./lib/speaker-matching.mjs";
+import { SpeakerStore } from "./lib/speaker-store.mjs";
+import { MeetingStore } from "./lib/meeting-store.mjs";
+import { reconcileTranscriptSpeakers } from "./lib/reconcile-speakers.mjs";
+import { RequestRateLimiter } from "./lib/request-rate-limiter.mjs";
+import { closeSqliteDatabases, openSqliteDatabase } from "./lib/sqlite-database.mjs";
+import { EmailDeliveryError, VerificationEmailService } from "./lib/email-service.mjs";
+import { BlobSpeakerStore } from "./lib/blob-speaker-store.mjs";
+import { PostgresDatabase, closePostgresDatabases } from "./lib/postgres-database.mjs";
+import { PostgresAuthStore } from "./lib/postgres-auth-store.mjs";
+import { PostgresMeetingStore } from "./lib/postgres-meeting-store.mjs";
+import { PostgresRequestRateLimiter } from "./lib/postgres-rate-limiter.mjs";
+import { MeetingIntelligenceService, transcriptHash } from "./lib/meeting-intelligence.mjs";
+
+const app = express();
+const port = Number(process.env.PORT) || 3001;
+const projectDirectory = path.dirname(fileURLToPath(import.meta.url));
+const dataDirectory = process.env.VOICE_PARTITION_DATA_DIR
+  ? path.resolve(process.env.VOICE_PARTITION_DATA_DIR)
+  : path.join(projectDirectory, ".data");
+const databasePath = process.env.VOICE_PARTITION_DATABASE_PATH
+  ? path.resolve(process.env.VOICE_PARTITION_DATABASE_PATH)
+  : path.join(dataDirectory, "voice-partition.sqlite");
+const emailVerificationSecret = process.env.EMAIL_VERIFICATION_SECRET
+  || (process.env.NODE_ENV === "production" ? "" : "voice-partition-development-verification-secret");
+if (!emailVerificationSecret) throw new Error("운영 환경에는 EMAIL_VERIFICATION_SECRET이 필요합니다.");
+const databaseMode = process.env.DATABASE_URL ? "postgresql" : "sqlite";
+const postgresDatabase = databaseMode === "postgresql"
+  ? new PostgresDatabase({
+    connectionString: process.env.DATABASE_URL,
+    maximumConnections: process.env.POSTGRES_POOL_MAX
+  })
+  : null;
+const authStore = postgresDatabase
+  ? new PostgresAuthStore(postgresDatabase, { verificationSecret: emailVerificationSecret })
+  : new AuthStore(path.join(dataDirectory, "auth"), { databasePath, verificationSecret: emailVerificationSecret });
+const speakerStorageMode = process.env.SPEAKER_STORAGE === "blob" || process.env.BLOB_READ_WRITE_TOKEN
+  ? "vercel-blob"
+  : "local";
+const speakerStore = speakerStorageMode === "vercel-blob"
+  ? new BlobSpeakerStore({
+    token: process.env.BLOB_READ_WRITE_TOKEN,
+    prefix: process.env.BLOB_SPEAKER_PREFIX,
+    encryptionKey: process.env.VOICE_BIOMETRIC_KEY
+  })
+  : new SpeakerStore(path.join(dataDirectory, "speakers"), {
+    encryptionKey: process.env.VOICE_BIOMETRIC_KEY,
+    requireEncryption: process.env.NODE_ENV === "production"
+  });
+const meetingStore = postgresDatabase
+  ? new PostgresMeetingStore(postgresDatabase)
+  : new MeetingStore(path.join(dataDirectory, "meetings"), { databasePath });
+const requestRateLimiter = postgresDatabase
+  ? new PostgresRequestRateLimiter(postgresDatabase)
+  : new RequestRateLimiter(databasePath);
+const emailService = new VerificationEmailService({
+  apiKey: process.env.RESEND_API_KEY,
+  from: process.env.RESEND_FROM_EMAIL,
+  environment: process.env.NODE_ENV
+});
+emailService.assertConfigured();
+const meetingIntelligenceService = new MeetingIntelligenceService({
+  apiKey: process.env.OPENAI_API_KEY,
+  model: process.env.OPENAI_ANALYSIS_MODEL
+});
+const speakerModelCache = process.env.SPEAKER_MODEL_CACHE || path.join(projectDirectory, ".cache", "speaker-models");
+const speakerModelPath = process.env.SPEAKER_MODEL_PATH || "";
+const maxAudioBytes = 25 * 1024 * 1024;
+const supportedMimeTypes = new Set([
+  "audio/flac", "audio/m4a", "audio/mp3", "audio/mp4", "audio/mpeg",
+  "audio/ogg", "audio/wav", "audio/x-wav", "audio/webm", "video/mp4", "video/webm"
+]);
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: maxAudioBytes, files: 1 },
+  fileFilter(_request, file, callback) {
+    callback(null, supportedMimeTypes.has(file.mimetype));
+  }
+});
+
+const sessionCookieName = "voice_partition_session";
+
+if (process.env.TRUST_PROXY) app.set("trust proxy", process.env.TRUST_PROXY === "true" ? 1 : process.env.TRUST_PROXY);
+
+function expectedOrigin(request) {
+  if (process.env.PUBLIC_ORIGIN) return process.env.PUBLIC_ORIGIN.replace(/\/$/, "");
+  const protocol = request.headers["x-forwarded-proto"]?.split(",", 1)[0]?.trim() || (request.socket.encrypted ? "https" : "http");
+  return `${protocol}://${request.headers.host}`;
+}
+
+function hasTrustedOrigin(request) {
+  const origin = request.headers.origin;
+  if (!origin) return true;
+  try {
+    return new URL(origin).origin === new URL(expectedOrigin(request)).origin;
+  } catch {
+    return false;
+  }
+}
+
+function requireTrustedOrigin(request, response, next) {
+  if (!hasTrustedOrigin(request)) {
+    return response.status(403).json({ error: "허용되지 않은 요청 출처입니다.", code: "ORIGIN_REJECTED" });
+  }
+  next();
+}
+
+function safeTokenEqual(left, right) {
+  const leftBuffer = Buffer.from(String(left || ""));
+  const rightBuffer = Buffer.from(String(right || ""));
+  return leftBuffer.length > 0 && leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function requireCsrf(request, response, next) {
+  if (!safeTokenEqual(request.headers["x-csrf-token"], request.auth?.csrfToken)) {
+    return response.status(403).json({ error: "보안 토큰이 만료됐습니다. 페이지를 새로고침해 주세요.", code: "CSRF_INVALID" });
+  }
+  next();
+}
+
+function rateLimit(scope, options, identify) {
+  return async (request, response, next) => {
+    const identity = identify(request);
+    const result = await requestRateLimiter.consume(`${scope}:${identity}`, options);
+    response.set("RateLimit-Limit", String(result.limit));
+    response.set("RateLimit-Remaining", String(result.remaining));
+    response.set("RateLimit-Reset", result.resetAt);
+    if (!result.allowed) {
+      response.set("Retry-After", String(result.retryAfterSeconds));
+      return response.status(429).json({
+        error: "요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.",
+        code: "RATE_LIMITED",
+        retryAfterSeconds: result.retryAfterSeconds
+      });
+    }
+    next();
+  };
+}
+
+const loginRateLimit = rateLimit("login", { limit: 10, windowMs: 15 * 60_000 }, (request) =>
+  `${request.ip}:${String(request.body?.email || "").trim().toLocaleLowerCase()}`);
+const signupRateLimit = rateLimit("signup", { limit: 5, windowMs: 60 * 60_000 }, (request) => request.ip);
+const verificationRateLimit = rateLimit("email-verification", { limit: 10, windowMs: 15 * 60_000 }, (request) =>
+  `${request.ip}:${String(request.body?.email || "").trim().toLocaleLowerCase()}`);
+const verificationResendRateLimit = rateLimit("email-verification-resend", { limit: 3, windowMs: 15 * 60_000 }, (request) =>
+  `${request.ip}:${String(request.body?.email || "").trim().toLocaleLowerCase()}`);
+const meetingAnalysisRateLimit = rateLimit("meeting-analysis", { limit: 12, windowMs: 60 * 60_000 }, (request) =>
+  `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
+const speakerEnrollmentRateLimit = rateLimit("speaker-enrollment", { limit: 12, windowMs: 60 * 60_000 }, (request) =>
+  `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
+
+app.use((request, response, next) => {
+  const startedAt = performance.now();
+  request.id = request.headers["x-request-id"] || randomUUID();
+  response.set("X-Request-ID", request.id);
+  response.set("X-Content-Type-Options", "nosniff");
+  response.set("Referrer-Policy", "strict-origin-when-cross-origin");
+  response.set("Permissions-Policy", "microphone=(self), camera=(), geolocation=()");
+  response.set("Cross-Origin-Opener-Policy", "same-origin");
+  response.set("X-Frame-Options", "DENY");
+  if (request.path.startsWith("/api/")) response.set("Cache-Control", "no-store");
+  if (process.env.NODE_ENV === "production") {
+    response.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    response.set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'");
+  }
+  response.on("finish", () => {
+    if (!request.path.startsWith("/api/") && response.statusCode < 400) return;
+    console.log(JSON.stringify({
+      level: response.statusCode >= 500 ? "error" : "info",
+      event: "http_request",
+      requestId: request.id,
+      method: request.method,
+      path: request.path,
+      status: response.statusCode,
+      durationMs: Math.round((performance.now() - startedAt) * 10) / 10,
+      userId: request.auth?.user?.id || null,
+      organizationId: request.auth?.organization?.id || null
+    }));
+  });
+  next();
+});
+
+function parseCookies(header = "") {
+  return Object.fromEntries(String(header).split(";").map((part) => {
+    const index = part.indexOf("=");
+    if (index < 0) return ["", ""];
+    return [part.slice(0, index).trim(), decodeURIComponent(part.slice(index + 1).trim())];
+  }).filter(([key]) => key));
+}
+
+function sessionToken(request) {
+  return parseCookies(request.headers.cookie)[sessionCookieName] || "";
+}
+
+function setSessionCookie(response, token, expiresAt) {
+  response.cookie(sessionCookieName, token, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    expires: new Date(expiresAt),
+    path: "/"
+  });
+}
+
+function clearSessionCookie(response) {
+  response.clearCookie(sessionCookieName, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    path: "/"
+  });
+}
+
+async function optionalAuth(request, _response, next) {
+  request.auth = await authStore.getContextBySession(sessionToken(request));
+  next();
+}
+
+async function requireAuth(request, response, next) {
+  request.auth = await authStore.getContextBySession(sessionToken(request));
+  if (!request.auth) return response.status(401).json({ error: "로그인이 필요합니다.", code: "UNAUTHENTICATED" });
+  next();
+}
+
+function requireOrganization(request, response, next) {
+  if (!request.auth?.organization) {
+    return response.status(409).json({ error: "먼저 조직을 만들거나 가입해 주세요.", code: "ORGANIZATION_REQUIRED" });
+  }
+  next();
+}
+
+function configuredServices() {
+  return {
+    openai: Boolean(process.env.OPENAI_API_KEY),
+    deepgram: Boolean(process.env.DEEPGRAM_API_KEY),
+    biometricEncryption: Boolean(process.env.VOICE_BIOMETRIC_KEY),
+    email: emailService.mode,
+    meetingIntelligence: meetingIntelligenceService.mode,
+    database: databaseMode,
+    speakerStorage: speakerStorageMode,
+    speakerModel: speakerModelInfo.id
+  };
+}
+
+function pcmToWave(pcm, sampleRate = 16_000) {
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write("WAVEfmt ", 8);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
+function decodeToPcm(input, maximumSeconds = 30) {
+  return new Promise((resolve, reject) => {
+    const argumentsList = [
+      "-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-vn",
+      "-ac", "1", "-ar", "16000"
+    ];
+    if (Number.isFinite(maximumSeconds) && maximumSeconds > 0) argumentsList.push("-t", String(maximumSeconds));
+    argumentsList.push("-f", "s16le", "pipe:1");
+    const ffmpeg = spawn("ffmpeg", argumentsList);
+    const output = [];
+    let errorText = "";
+
+    ffmpeg.stdout.on("data", (chunk) => output.push(chunk));
+    ffmpeg.stderr.on("data", (chunk) => { errorText += chunk.toString(); });
+    ffmpeg.on("error", (error) => reject(new Error(`ffmpeg를 실행할 수 없습니다: ${error.message}`)));
+    ffmpeg.on("close", (code) => {
+      if (code !== 0) return reject(new Error(errorText.trim() || "음성 파일을 변환하지 못했습니다."));
+      resolve(Buffer.concat(output));
+    });
+    ffmpeg.stdin.end(input);
+  });
+}
+
+async function enrollProfile(pcm) {
+  const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath);
+  const samples = new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2));
+  const profile = await model.createProfile(samples);
+  const vectors = [profile.centroid, ...profile.exemplars];
+  return {
+    buffer: Buffer.concat(vectors.map((vector) => Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength))),
+    vectors,
+    count: vectors.length,
+    consistency: profile.consistency,
+    matchThreshold: profile.matchThreshold
+  };
+}
+
+app.disable("x-powered-by");
+app.use(express.json({ limit: "64kb" }));
+
+app.post("/api/auth/signup", requireTrustedOrigin, signupRateLimit, async (request, response) => {
+  const user = await authStore.signup(request.body || {});
+  const verification = await authStore.issueEmailVerification(user.id);
+  const delivery = await emailService.sendVerification({
+    email: user.email,
+    name: user.name,
+    code: verification.code,
+    expiresAt: verification.expiresAt,
+    idempotencyKey: `email-verification-${user.id}-${verification.expiresAt}`
+  });
+  response.status(202).json({
+    verificationRequired: true,
+    email: user.email,
+    expiresAt: verification.expiresAt,
+    delivery: delivery.provider,
+    ...(delivery.developmentCode ? { developmentCode: delivery.developmentCode } : {})
+  });
+});
+
+app.post("/api/auth/verify-email", requireTrustedOrigin, verificationRateLimit, async (request, response) => {
+  const user = await authStore.verifyEmail(request.body?.email, request.body?.code);
+  const session = await authStore.createSession(user.id);
+  setSessionCookie(response, session.token, session.expiresAt);
+  response.json(await authStore.getContextBySession(session.token));
+});
+
+app.post("/api/auth/verification/resend", requireTrustedOrigin, verificationResendRateLimit, async (request, response) => {
+  const verification = await authStore.resendEmailVerification(request.body?.email, request.body?.password);
+  const delivery = await emailService.sendVerification({
+    email: verification.user.email,
+    name: verification.user.name,
+    code: verification.code,
+    expiresAt: verification.expiresAt,
+    idempotencyKey: `email-verification-${verification.user.id}-${verification.expiresAt}`
+  });
+  response.json({
+    verificationRequired: true,
+    email: verification.user.email,
+    expiresAt: verification.expiresAt,
+    delivery: delivery.provider,
+    ...(delivery.developmentCode ? { developmentCode: delivery.developmentCode } : {})
+  });
+});
+
+app.post("/api/auth/login", requireTrustedOrigin, loginRateLimit, async (request, response) => {
+  const user = await authStore.authenticate(request.body?.email, request.body?.password);
+  const session = await authStore.createSession(user.id);
+  setSessionCookie(response, session.token, session.expiresAt);
+  response.json(await authStore.getContextBySession(session.token));
+});
+
+app.post("/api/auth/logout", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
+  await authStore.deleteSession(sessionToken(request));
+  clearSessionCookie(response);
+  response.status(204).end();
+});
+
+app.get("/api/session", optionalAuth, async (request, response) => {
+  if (!request.auth) return response.json({ authenticated: false });
+  response.json({ authenticated: true, ...request.auth });
+});
+
+app.get("/api/organizations/suggestion", requireAuth, async (request, response) => {
+  response.json({ suggestion: await authStore.organizationSuggestion(request.auth.user.id) });
+});
+
+app.post("/api/organizations", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
+  response.status(201).json(await authStore.createOrganization(request.auth.user.id, request.body || {}));
+});
+
+app.post("/api/organizations/join", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
+  response.json(await authStore.joinOrganization(request.auth.user.id, request.body?.inviteCode));
+});
+
+app.get("/api/organizations/current/members", requireAuth, requireOrganization, async (request, response) => {
+  const members = await authStore.listMembers(request.auth.user.id, request.auth.organization.id);
+  response.json({ organization: request.auth.organization, members });
+});
+
+app.put("/api/profile/vocabulary", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
+  response.json(await authStore.updateVocabulary(request.auth.user.id, request.body || {}));
+});
+
+app.get("/api/health", optionalAuth, async (request, response) => {
+  const speakers = request.auth?.organization ? await speakerStore.list(request.auth.organization.id) : [];
+  response.json({ ok: true, services: configuredServices(), speakerCount: speakers.length });
+});
+
+app.get("/api/health/live", (_request, response) => {
+  response.json({ ok: true, status: "live" });
+});
+
+app.get("/api/health/ready", async (_request, response) => {
+  try {
+    if (postgresDatabase) await postgresDatabase.healthCheck();
+    else (await openSqliteDatabase(databasePath)).prepare("SELECT 1").get();
+    const deepgramConfigured = Boolean(process.env.DEEPGRAM_API_KEY);
+    const emailConfigured = emailService.mode === "resend" || process.env.NODE_ENV !== "production";
+    const ready = process.env.NODE_ENV !== "production" || (deepgramConfigured && emailConfigured);
+    response.status(ready ? 200 : 503).json({
+      ok: ready,
+      status: ready ? "ready" : "degraded",
+      database: `${databaseMode}:ready`,
+      deepgram: deepgramConfigured ? "configured" : "missing",
+      email: emailConfigured ? emailService.mode : "missing"
+    });
+  } catch (error) {
+    response.status(503).json({ ok: false, status: "unavailable", database: "unavailable" });
+  }
+});
+
+app.get("/api/speakers", requireAuth, requireOrganization, async (request, response) => {
+  response.json({ speakers: await speakerStore.list(request.auth.organization.id) });
+});
+
+app.get("/api/meetings", requireAuth, requireOrganization, async (request, response) => {
+  response.json({ meetings: await meetingStore.list(request.auth.organization.id) });
+});
+
+app.get("/api/meetings/:id", requireAuth, requireOrganization, async (request, response) => {
+  const meeting = await meetingStore.get(request.params.id, request.auth.organization.id);
+  if (!meeting) return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
+  response.json({ meeting });
+});
+
+app.post("/api/meetings", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
+  const meeting = await meetingStore.create({
+    organizationId: request.auth.organization.id,
+    createdBy: request.auth.user.id,
+    language: request.body?.language,
+    source: request.body?.source,
+    mode: request.body?.mode,
+    title: request.body?.title
+  });
+  response.status(201).json({ meeting });
+});
+
+app.patch("/api/meetings/:id", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
+  const meeting = await meetingStore.update(request.params.id, request.auth.organization.id, request.body || {});
+  if (!meeting) return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
+  response.json({ meeting });
+});
+
+app.get("/api/meetings/:id/intelligence", requireAuth, requireOrganization, async (request, response) => {
+  const meeting = await meetingStore.get(request.params.id, request.auth.organization.id);
+  if (!meeting) return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
+  const hash = transcriptHash(meeting.segments);
+  response.json({ intelligence: await meetingStore.getIntelligence(meeting.id, request.auth.organization.id, hash) });
+});
+
+app.post("/api/meetings/:id/intelligence", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
+  meetingAnalysisRateLimit, async (request, response) => {
+    const meeting = await meetingStore.get(request.params.id, request.auth.organization.id);
+    if (!meeting) return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
+    if (!meeting.segments.length) return response.status(409).json({ error: "분석할 실제 발화가 없습니다." });
+    const hash = transcriptHash(meeting.segments);
+    if (!request.body?.force) {
+      const cached = await meetingStore.getIntelligence(meeting.id, request.auth.organization.id, hash);
+      if (cached) return response.json({ intelligence: cached, cached: true });
+    }
+    try {
+      const result = await meetingIntelligenceService.analyze(meeting, request.auth.user.vocabulary || {});
+      const intelligence = await meetingStore.saveIntelligence({
+        meetingId: meeting.id,
+        organizationId: request.auth.organization.id,
+        transcriptHash: hash,
+        source: result.source,
+        model: result.model,
+        result
+      });
+      return response.json({ intelligence, cached: false });
+    } catch (error) {
+      console.error("Meeting intelligence failed:", error);
+      return response.status(error?.name === "AbortError" ? 504 : 502).json({
+        error: error?.name === "AbortError" ? "회의 분석 시간이 초과되었습니다." : "회의 구조 분석을 완료하지 못했습니다. 잠시 후 다시 시도해 주세요."
+      });
+    }
+  });
+
+app.post("/api/speakers", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, speakerEnrollmentRateLimit, upload.single("voice"), async (request, response) => {
+  const name = typeof request.body?.name === "string" ? request.body.name.trim() : "";
+  if (!name || name.length > 40) return response.status(400).json({ error: "이름은 1~40자로 입력해 주세요." });
+  if (!request.file) return response.status(400).json({ error: "MP3 또는 WAV 등록 음성이 필요합니다." });
+
+  try {
+    const existing = await speakerStore.list(request.auth.organization.id);
+    if (existing.some((speaker) => speaker.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+      return response.status(409).json({ error: "이미 등록된 이름입니다." });
+    }
+
+    const pcm = await decodeToPcm(request.file.buffer);
+    const duration = pcm.length / 2 / 16_000;
+    if (duration < 5) return response.status(400).json({ error: "등록 음성은 한 사람의 말소리가 포함된 5초 이상이어야 합니다." });
+    const quality = analyzePcmQuality(new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2)));
+    if (!quality.usable) {
+      return response.status(422).json({
+        error: quality.warnings[0] || "등록 음성 품질이 충분하지 않습니다.",
+        quality
+      });
+    }
+    const profile = await enrollProfile(pcm);
+    const enrolledAt = new Date().toISOString();
+    const speaker = {
+      id: randomUUID(), name, duration, model: speakerModelInfo.id,
+      profileCount: profile.count,
+      profileDimensions: speakerModelInfo.dimensions,
+      enrollmentConsistency: profile.consistency,
+      matchThreshold: profile.matchThreshold,
+      audioQuality: quality,
+      enrollmentSessionCount: 1,
+      totalEnrollmentDuration: duration,
+      lastEnrolledAt: enrolledAt,
+      enrollmentSessions: [{ duration, qualityScore: quality.score, enrolledAt }],
+      organizationId: request.auth.organization.id,
+      createdBy: request.auth.user.id,
+      createdAt: new Date().toISOString()
+    };
+    const storedSpeaker = await speakerStore.save(speaker, profile.buffer, pcmToWave(pcm));
+    return response.status(201).json({ speaker: storedSpeaker });
+  } catch (error) {
+    console.error("Speaker enrollment failed:", error);
+    return response.status(422).json({ error: error.message || "목소리를 등록하지 못했습니다." });
+  }
+});
+
+app.post("/api/speakers/:id/samples", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, speakerEnrollmentRateLimit, upload.single("voice"), async (request, response) => {
+  if (!/^[a-f0-9-]{36}$/i.test(request.params.id)) return response.status(400).json({ error: "잘못된 화자 ID입니다." });
+  if (!request.file) return response.status(400).json({ error: "MP3 또는 WAV 추가 음성이 필요합니다." });
+  try {
+    const existing = (await speakerStore.loadProfiles(request.auth.organization.id)).find(({ id }) => id === request.params.id);
+    if (!existing) return response.status(404).json({ error: "등록된 목소리를 찾지 못했습니다." });
+    if ((existing.enrollmentSessionCount || 1) >= 8) return response.status(409).json({ error: "한 사람당 최대 8회까지 음성을 추가할 수 있습니다." });
+    const pcm = await decodeToPcm(request.file.buffer);
+    const duration = pcm.length / 2 / 16_000;
+    if (duration < 5) return response.status(400).json({ error: "추가 음성은 한 사람의 말소리가 포함된 5초 이상이어야 합니다." });
+    const quality = analyzePcmQuality(new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2)));
+    if (!quality.usable) return response.status(422).json({ error: quality.warnings[0] || "추가 음성 품질이 충분하지 않습니다.", quality });
+    const additional = await enrollProfile(pcm);
+    const merged = mergeSpeakerProfileVectors([existing.profiles, additional.vectors], { maximumProfiles: 32 });
+    const profileBuffer = Buffer.concat(merged.vectors.map((vector) => Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength)));
+    const now = new Date().toISOString();
+    const updated = {
+      ...existing,
+      profileCount: merged.vectors.length,
+      enrollmentConsistency: merged.consistency,
+      matchThreshold: merged.matchThreshold,
+      enrollmentSessionCount: (existing.enrollmentSessionCount || 1) + 1,
+      totalEnrollmentDuration: (existing.totalEnrollmentDuration || existing.duration || 0) + duration,
+      lastEnrolledAt: now,
+      latestAudioQuality: quality,
+      enrollmentSessions: [...(existing.enrollmentSessions || []), { duration, qualityScore: quality.score, enrolledAt: now }].slice(-8)
+    };
+    delete updated.profile;
+    delete updated.profiles;
+    delete updated.referenceAudio;
+    const referenceAudio = quality.score > (existing.audioQuality?.score || 0) ? pcmToWave(pcm) : existing.referenceAudio;
+    const storedSpeaker = await speakerStore.replace(updated, profileBuffer, referenceAudio, request.auth.organization.id);
+    return response.json({ speaker: storedSpeaker });
+  } catch (error) {
+    console.error("Speaker sample enrollment failed:", error);
+    return response.status(422).json({ error: error.message || "추가 목소리를 등록하지 못했습니다." });
+  }
+});
+
+app.delete("/api/speakers/:id", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
+  if (!/^[a-f0-9-]{36}$/i.test(request.params.id)) return response.status(400).json({ error: "잘못된 화자 ID입니다." });
+  const removed = await speakerStore.remove(request.params.id, request.auth.organization.id);
+  if (!removed) return response.status(404).json({ error: "등록된 목소리를 찾지 못했습니다." });
+  response.status(204).end();
+});
+
+app.post("/api/transcribe", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, upload.single("audio"), async (request, response) => {
+  if (!process.env.OPENAI_API_KEY) return response.status(503).json({ error: "OPENAI_API_KEY가 설정되지 않았습니다." });
+  if (!request.file) return response.status(400).json({ error: "지원되는 오디오 파일이 필요합니다." });
+
+  try {
+    const form = new FormData();
+    form.append("file", new Blob([request.file.buffer], { type: request.file.mimetype }), request.file.originalname || "recording.webm");
+    form.append("model", "gpt-4o-transcribe-diarize");
+    form.append("response_format", "diarized_json");
+    form.append("chunking_strategy", "auto");
+
+    const language = typeof request.body?.language === "string" ? request.body.language.trim() : "";
+    if (language) form.append("language", language);
+
+    const knownSpeakers = (await speakerStore.loadProfiles(request.auth.organization.id)).slice(0, 4);
+    const knownSpeakerReferences = [];
+    for (const speaker of knownSpeakers) {
+      knownSpeakerReferences.push(`data:audio/wav;base64,${speaker.referenceAudio.toString("base64")}`);
+    }
+    if (knownSpeakers.length) {
+      form.append("known_speaker_names", JSON.stringify(knownSpeakers.map(({ name }) => name)));
+      form.append("known_speaker_references", JSON.stringify(knownSpeakerReferences));
+    }
+
+    const openAIResponse = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+      body: form,
+      signal: AbortSignal.timeout(120_000)
+    });
+    const payload = await openAIResponse.json().catch(() => null);
+    if (!openAIResponse.ok) {
+      return response.status(openAIResponse.status).json({ error: payload?.error?.message || "음성을 전사하지 못했습니다." });
+    }
+    const normalized = normalizeTranscript(payload, { knownSpeakers: knownSpeakers.map(({ name }) => name) });
+    if (!knownSpeakers.length) return response.json(normalized);
+    try {
+      const decoded = await decodeToPcm(request.file.buffer, 1_800);
+      const pcm = new Int16Array(decoded.buffer, decoded.byteOffset, Math.floor(decoded.byteLength / 2));
+      const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath);
+      const reconciled = await reconcileTranscriptSpeakers(normalized, pcm, knownSpeakers, model, {
+        threshold: Number(process.env.SPEAKER_MATCH_THRESHOLD) || 0.72,
+        margin: Number(process.env.SPEAKER_MATCH_MARGIN) || 0.04
+      });
+      return response.json(reconciled);
+    } catch (speakerError) {
+      console.error("Final speaker reconciliation failed:", speakerError);
+      return response.json(normalized);
+    }
+  } catch (error) {
+    if (error?.name === "TimeoutError") return response.status(504).json({ error: "전사 시간이 초과되었습니다." });
+    console.error("Transcription failed:", error);
+    return response.status(500).json({ error: "전사 중 서버 오류가 발생했습니다." });
+  }
+});
+
+app.use("/api", (_request, response) => {
+  response.status(404).json({ error: "API 경로를 찾지 못했습니다." });
+});
+
+app.use((error, _request, response, _next) => {
+  if (error instanceof AuthError) {
+    return response.status(error.status).json({
+      error: error.message,
+      code: error.code,
+      ...(error.retryAfterSeconds ? { retryAfterSeconds: error.retryAfterSeconds } : {}),
+      ...(error.remainingAttempts ? { remainingAttempts: error.remainingAttempts } : {})
+    });
+  }
+  if (error instanceof EmailDeliveryError) {
+    return response.status(502).json({ error: error.message, code: error.code });
+  }
+  if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
+    return response.status(413).json({ error: "오디오 파일은 25MB 이하여야 합니다." });
+  }
+  console.error("Request failed:", error);
+  return response.status(400).json({ error: "요청을 처리할 수 없습니다." });
+});
+
+await Promise.all([authStore.initialize(), speakerStore.initialize(), meetingStore.initialize(), requestRateLimiter.initialize()]);
+const server = app.listen(port, () => {
+  console.log(`Voice Partition is running at http://localhost:${port}`);
+});
+
+const liveServer = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (request, socket, head) => {
+  const requestUrl = new URL(request.url, `http://${request.headers.host}`);
+  if (requestUrl.pathname !== "/api/live") return;
+  if (!hasTrustedOrigin(request)) {
+    socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+    return socket.destroy();
+  }
+  liveServer.handleUpgrade(request, socket, head, (websocket) => {
+    liveServer.emit("connection", websocket, request, requestUrl);
+  });
+});
+
+liveServer.on("connection", async (client, request, requestUrl) => {
+  if (!process.env.DEEPGRAM_API_KEY) {
+    client.send(JSON.stringify({ type: "error", message: "DEEPGRAM_API_KEY가 필요합니다." }));
+    return client.close(1011);
+  }
+
+  let deepgram;
+  let finalizeFallback;
+  try {
+    const auth = await authStore.getContextBySession(sessionToken(request));
+    if (!auth) throw new Error("로그인이 필요합니다.");
+    if (!auth.organization) throw new Error("먼저 조직을 만들거나 가입해 주세요.");
+    const mode = requestUrl.searchParams.get("mode") === "speaker" ? "speaker" : "stt";
+    const speakers = mode === "speaker" ? await speakerStore.loadProfiles(auth.organization.id) : [];
+    if (mode === "speaker" && !speakers.length) throw new Error("화자 식별 모드에는 등록 목소리가 한 명 이상 필요합니다.");
+    if (mode === "speaker" && speakers.some(({ profiles }) => profiles.some((profile) => profile.length !== speakerModelInfo.dimensions))) {
+      throw new Error("이전 방식으로 등록된 목소리가 있습니다. 삭제하고 다시 등록해 주세요.");
+    }
+    const speakerModel = mode === "speaker" ? await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath) : null;
+    const profiles = speakers.map(({ profiles: candidates }) => candidates);
+    const identityTracker = mode === "speaker" ? new SpeakerIdentityTracker() : null;
+    const recognitionFrames = [];
+    const analyzedRegions = new Set();
+    let audioHistory = Buffer.alloc(0);
+    let audioHistoryStartSample = 0;
+    let totalSamples = 0;
+
+    const analyzeDiarizedRegions = async (words) => {
+      for (const region of diarizedAudioRegions(words)) {
+        const cacheKey = `${region.sourceSpeaker}:${region.start.toFixed(2)}:${region.end.toFixed(2)}`;
+        if (analyzedRegions.has(cacheKey)) continue;
+        const firstSample = Math.max(audioHistoryStartSample, Math.floor(region.start * speakerModelInfo.sampleRate));
+        const lastSample = Math.min(totalSamples, Math.ceil(region.end * speakerModelInfo.sampleRate));
+        if (lastSample - firstSample < speakerModelInfo.sampleRate) continue;
+        const firstByte = (firstSample - audioHistoryStartSample) * 2;
+        const lastByte = (lastSample - audioHistoryStartSample) * 2;
+        const snapshot = Buffer.from(audioHistory.subarray(firstByte, lastByte));
+        try {
+          const pcm = new Int16Array(snapshot.buffer, snapshot.byteOffset, snapshot.byteLength / 2);
+          const scores = await speakerModel.compare(pcm, profiles);
+          if (scores) {
+            recognitionFrames.push({
+              start: region.start,
+              end: region.end,
+              sourceSpeaker: region.sourceSpeaker,
+              weight: Math.min(8, region.end - region.start),
+              scores
+            });
+            analyzedRegions.add(cacheKey);
+          }
+        } catch (error) {
+          console.error("Diarized speaker inference failed:", error);
+        }
+      }
+    };
+
+    const languageMap = { ko: "ko-KR", en: "en-US", ja: "ja" };
+    const language = languageMap[requestUrl.searchParams.get("language")] || "ko-KR";
+    const query = new URLSearchParams({
+      model: "nova-3", language, encoding: "linear16", sample_rate: "16000", channels: "1",
+      interim_results: "true", endpointing: "300", punctuate: "true", smart_format: "true"
+    });
+    if (mode === "speaker") query.set("diarize_model", "latest");
+    deepgram = new WebSocket(`wss://api.deepgram.com/v1/listen?${query}`, {
+      headers: { Authorization: `Token ${process.env.DEEPGRAM_API_KEY}` }
+    });
+
+    deepgram.on("open", () => client.readyState === WebSocket.OPEN && client.send(JSON.stringify({
+      type: "ready", mode, sampleRate: speakerModelInfo.sampleRate, speakers: speakers.map(({ id, name }) => ({ id, name }))
+    })));
+
+    let transcriptQueue = Promise.resolve();
+    let finalizationAcknowledged = false;
+    const acknowledgeFinalization = () => {
+      if (finalizationAcknowledged) return;
+      finalizationAcknowledged = true;
+      clearTimeout(finalizeFallback);
+      transcriptQueue.finally(() => {
+        if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: "finalized" }));
+      });
+    };
+    deepgram.on("message", (raw) => {
+      const event = JSON.parse(raw.toString());
+      if (event.type !== "Results") return;
+      const alternative = event.channel?.alternatives?.[0];
+      if (alternative?.words?.length) {
+        transcriptQueue = transcriptQueue.then(async () => {
+          if (mode === "speaker" && event.is_final) await analyzeDiarizedRegions(alternative.words);
+          const segments = mode === "speaker"
+            ? wordsToSegments(alternative.words, recognitionFrames, speakers, {
+              threshold: Number(process.env.SPEAKER_MATCH_THRESHOLD) || 0.72,
+              margin: Number(process.env.SPEAKER_MATCH_MARGIN) || 0.04,
+              tracker: identityTracker
+            })
+            : wordsToTranscriptSegments(alternative.words);
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({ type: "transcript", isFinal: Boolean(event.is_final), speechFinal: Boolean(event.speech_final), segments }));
+          }
+          const earliestNeeded = Number(event.start ?? 0) - 4;
+          while (recognitionFrames.length && recognitionFrames[0].end < earliestNeeded) recognitionFrames.shift();
+        }).catch((error) => {
+          console.error("Transcript processing failed:", error);
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({ type: "error", message: "실시간 화자 분석을 처리하지 못했습니다." }));
+          }
+        });
+      }
+      if (event.from_finalize) acknowledgeFinalization();
+    });
+
+    deepgram.on("error", (error) => {
+      if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: "error", message: `실시간 STT 연결 오류: ${error.message}` }));
+    });
+    deepgram.on("close", () => client.readyState === WebSocket.OPEN && client.close(1011, "STT connection closed"));
+
+    client.on("message", (data, isBinary) => {
+      if (deepgram.readyState !== WebSocket.OPEN) return;
+      if (!isBinary) {
+        try {
+          const control = JSON.parse(data.toString());
+          if (control.type === "finalize" && !finalizationAcknowledged) {
+            deepgram.send(JSON.stringify({ type: "Finalize" }));
+            finalizeFallback = setTimeout(acknowledgeFinalization, 3_500);
+          } else if (control.type === "speakerCorrection" && mode === "speaker" && identityTracker) {
+            const sourceSpeaker = String(control.sourceSpeaker ?? "").slice(0, 40);
+            const selected = speakers.find(({ name }) => name === String(control.speakerName || ""));
+            if (sourceSpeaker && selected) {
+              identityTracker.correct(sourceSpeaker, selected);
+              client.send(JSON.stringify({ type: "speakerCorrectionAccepted", sourceSpeaker, speaker: selected.name }));
+            }
+          }
+        } catch {
+          // Ignore malformed client control messages without interrupting audio.
+        }
+        return;
+      }
+      const incoming = Buffer.from(data);
+      deepgram.send(incoming);
+      if (mode !== "speaker") return;
+      audioHistory = Buffer.concat([audioHistory, incoming]);
+      const receivedSamples = incoming.length / 2;
+      totalSamples += receivedSamples;
+      const maximumHistoryBytes = speakerModelInfo.sampleRate * 90 * 2;
+      if (audioHistory.length > maximumHistoryBytes) {
+        const removedBytes = audioHistory.length - maximumHistoryBytes;
+        audioHistory = audioHistory.subarray(removedBytes);
+        audioHistoryStartSample += removedBytes / 2;
+      }
+    });
+  } catch (error) {
+    console.error("Live session failed:", error);
+    if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: "error", message: error.message }));
+    client.close(1011);
+  }
+
+  client.on("close", () => {
+    clearTimeout(finalizeFallback);
+    if (deepgram?.readyState === WebSocket.OPEN) {
+      deepgram.send(JSON.stringify({ type: "CloseStream" }));
+      deepgram.close();
+    }
+  });
+});
+
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(JSON.stringify({ level: "info", event: "shutdown_started", signal }));
+  for (const client of liveServer.clients) client.close(1012, "Server restarting");
+  liveServer.close();
+  const forcedExit = setTimeout(() => {
+    console.error(JSON.stringify({ level: "error", event: "shutdown_forced", signal }));
+    server.closeAllConnections?.();
+    process.exit(1);
+  }, 10_000);
+  forcedExit.unref();
+  server.close(async () => {
+    closeSqliteDatabases();
+    await closePostgresDatabases();
+    clearTimeout(forcedExit);
+    console.log(JSON.stringify({ level: "info", event: "shutdown_completed", signal }));
+    process.exit(0);
+  });
+}
+
+process.once("SIGTERM", () => shutdown("SIGTERM"));
+process.once("SIGINT", () => shutdown("SIGINT"));

@@ -1,0 +1,123 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  chooseKnownSpeaker, diarizedAudioRegions, SpeakerIdentityTracker, wordsToSegments, wordsToTranscriptSegments
+} from "../lib/speaker-matching.mjs";
+import { cosineSimilarity, mergeSpeakerProfileVectors, pcmRms } from "../lib/speaker-embedding-model.mjs";
+
+const speakers = [{ id: "one", name: "민수" }, { id: "two", name: "지수" }];
+
+test("accepts a registered speaker above threshold and margin", () => {
+  assert.deepEqual(chooseKnownSpeaker([0.91, 0.32], speakers), { id: "one", name: "민수", score: 0.91 });
+});
+
+test("rejects ambiguous and low-scoring voices", () => {
+  assert.equal(chooseKnownSpeaker([0.68, 0.2], speakers), null);
+  assert.equal(chooseKnownSpeaker([0.92, 0.89], speakers), null);
+});
+
+test("uses enrollment-specific thresholds and stabilizes a diarized speaker cluster", () => {
+  const calibrated = [{ id: "one", name: "민수", matchThreshold: 0.78 }, { id: "two", name: "지수" }];
+  assert.equal(chooseKnownSpeaker([0.76, 0.2], calibrated), null);
+
+  const tracker = new SpeakerIdentityTracker();
+  assert.equal(tracker.identify(0, [0.9, 0.2], speakers)?.name, "민수");
+  assert.equal(tracker.identify(0, [0.69, 0.67], speakers)?.name, "민수");
+  assert.equal(tracker.identify(1, [0.2, 0.91], speakers)?.name, "지수");
+});
+
+test("manual cluster correction overrides later model scores without claiming model confidence", () => {
+  const tracker = new SpeakerIdentityTracker();
+  assert.equal(tracker.identify(0, [0.91, 0.2], speakers)?.name, "민수");
+  assert.equal(tracker.correct(0, speakers[1])?.name, "지수");
+  const result = wordsToSegments(
+    [{ start: 3, end: 4, word: "확인했습니다", speaker: 0 }],
+    [{ start: 3, end: 4, sourceSpeaker: "0", scores: [0.96, 0.12] }],
+    speakers,
+    { tracker }
+  );
+  assert.equal(result[0].speaker, "지수");
+  assert.equal(result[0].confidence, null);
+  assert.equal(result[0].corrected, true);
+});
+
+test("labels words with known names and keeps an unknown diarization label", () => {
+  const frames = [
+    { start: 0, end: 1, scores: [0.9, 0.1] },
+    { start: 1, end: 2, scores: [0.88, 0.12] }
+  ];
+  const words = [
+    { start: 0.1, end: 0.5, word: "안녕", speaker: 0 },
+    { start: 0.6, end: 1.0, word: "하세요", speaker: 0 },
+    { start: 3.0, end: 3.4, word: "누구세요", speaker: 1 }
+  ];
+
+  assert.deepEqual(wordsToSegments(words, frames, speakers), [
+    { speaker: "민수", known: true, confidence: 0.9, sourceSpeaker: "0", start: 0.1, end: 1, text: "안녕 하세요" },
+    { speaker: "미등록 화자 B", known: false, confidence: null, sourceSpeaker: "1", start: 3, end: 3.4, text: "누구세요" }
+  ]);
+});
+
+test("does not call the first two seconds an unknown speaker before identification is ready", () => {
+  const [segment] = wordsToSegments([{ start: 0, end: 1.2, word: "안녕하세요", speaker: 0 }], [], speakers);
+  assert.equal(segment.speaker, "화자 확인 중");
+});
+
+test("reuses a stable cluster identity when a later word has no overlapping frame", () => {
+  const tracker = new SpeakerIdentityTracker();
+  const frames = [{ start: 0, end: 2, scores: [0.9, 0.2] }];
+  const result = wordsToSegments([
+    { start: 0.2, end: 1.2, word: "첫째", speaker: 0 },
+    { start: 4, end: 5, word: "둘째", speaker: 0 }
+  ], frames, speakers, { tracker });
+  assert.deepEqual(result.map(({ speaker }) => speaker), ["민수", "민수"]);
+});
+
+test("extracts only sufficiently long contiguous regions from each diarized speaker", () => {
+  assert.deepEqual(diarizedAudioRegions([
+    { start: 0, end: 0.6, speaker: 0 },
+    { start: 0.7, end: 1.4, speaker: 0 },
+    { start: 1.45, end: 2.7, speaker: 1 },
+    { start: 3.8, end: 4.2, speaker: 1 }
+  ]), [
+    { sourceSpeaker: "0", start: 0, end: 1.4, wordCount: 2 },
+    { sourceSpeaker: "1", start: 1.45, end: 2.7, wordCount: 1 }
+  ]);
+});
+
+test("does not mix overlapping embeddings from another diarization cluster", () => {
+  const frames = [
+    { start: 0, end: 2, sourceSpeaker: "1", scores: [0.1, 0.95], weight: 2 },
+    { start: 0, end: 2, sourceSpeaker: "0", scores: [0.91, 0.2], weight: 2 }
+  ];
+  const [segment] = wordsToSegments([{ start: 0.4, end: 1.2, word: "안녕하세요", speaker: 0 }], frames, speakers);
+  assert.equal(segment.speaker, "민수");
+  assert.equal(segment.confidence, 0.91);
+});
+
+test("computes normalized speaker similarity and detects silence", () => {
+  assert.equal(cosineSimilarity(new Float32Array([1, 0]), new Float32Array([1, 0])), 1);
+  assert.equal(cosineSimilarity(new Float32Array([1, 0]), new Float32Array([0, 1])), 0);
+  assert.equal(pcmRms(new Int16Array(160)), 0);
+  assert.ok(pcmRms(new Int16Array([16384, -16384])) > 0.49);
+});
+
+test("merges and deduplicates speaker profiles across enrollment sessions", () => {
+  const result = mergeSpeakerProfileVectors([
+    [new Float32Array([1, 0]), new Float32Array([1, 0])],
+    [new Float32Array([0.8, 0.2]), new Float32Array([0.7, 0.3])]
+  ]);
+  assert.equal(result.vectors.length, 4);
+  assert.ok(result.consistency > 0.9);
+  assert.ok(result.matchThreshold >= 0.68 && result.matchThreshold <= 0.82);
+});
+
+test("creates a speaker-free segment for isolated STT testing", () => {
+  assert.deepEqual(wordsToTranscriptSegments([
+    { start: 0.2, end: 0.6, word: "안녕" },
+    { start: 0.7, end: 1.1, punctuated_word: "하세요." }
+  ]), [{
+    speaker: "실시간 STT", known: false, confidence: null, sourceSpeaker: null,
+    start: 0.2, end: 1.1, text: "안녕 하세요."
+  }]);
+});
