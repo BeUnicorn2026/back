@@ -23,6 +23,8 @@ import { PostgresAuthStore } from "./lib/postgres-auth-store.mjs";
 import { PostgresMeetingStore } from "./lib/postgres-meeting-store.mjs";
 import { PostgresRequestRateLimiter } from "./lib/postgres-rate-limiter.mjs";
 import { MeetingIntelligenceService, transcriptHash } from "./lib/meeting-intelligence.mjs";
+import { PcmHistoryBuffer } from "./lib/pcm-history-buffer.mjs";
+import { buildSttKeyterms } from "./lib/stt-keyterms.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 3001;
@@ -785,6 +787,13 @@ liveServer.on("connection", async (client, request, requestUrl) => {
       interim_results: "true", endpointing: "300", punctuate: "true", smart_format: "true"
     });
     if (mode === "speaker") query.set("diarize_model", "latest");
+    const organizationTerms = await meetingStore.listVocabularyTerms(auth.organization.id, auth.user.vocabulary?.knownTerms || []);
+    const keyterms = buildSttKeyterms({
+      knownTerms: auth.user.vocabulary?.knownTerms || [],
+      organizationTerms,
+      speakerNames: speakers.map(({ name }) => name)
+    });
+    for (const keyterm of keyterms) query.append("keyterm", keyterm);
     deepgram = new WebSocket(`wss://api.deepgram.com/v1/listen?${query}`, {
       headers: { Authorization: `Token ${process.env.DEEPGRAM_API_KEY}` }
     });
