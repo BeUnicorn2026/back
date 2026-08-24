@@ -40,6 +40,13 @@ test("diminishes repeated weak evidence and decays belief toward its prior", () 
   assert.ok(Math.abs(later.logOdds - later.priorLogOdds) < Math.abs(third.state.logOdds - third.state.priorLogOdds));
 });
 
+test("keeps direct user corrections as the new long-term prior", () => {
+  const onboardingKnown = initialKnowledgeState({ prior: 0.9, now });
+  const corrected = applyKnowledgeEvidence(onboardingKnown, "mark_unknown", { now }).state;
+  const oneYearLater = decayedKnowledgeState(corrected, { now: "2027-08-24T00:00:00.000Z" });
+  assert.ok(Math.abs(knowledgeView(oneYearLater).pKnown - 0.08) < 0.001);
+});
+
 test("explanation policy prioritizes explicitly unknown concepts without hiding new concepts", () => {
   const initial = initialKnowledgeState({ now });
   assert.equal(shouldExplainConcept(initial, { now }), true);
