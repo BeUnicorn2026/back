@@ -1,0 +1,11 @@
+node_modules/
+.env
+.data/
+.cache/
+output/
+coverage/
+.DS_Store
+._*
+.agents/
+.codex/
+AGENTS.md

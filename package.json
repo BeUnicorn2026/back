@@ -1,0 +1,28 @@
+{
+  "name": "voice-partition-back",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.13.0" },
+  "scripts": {
+    "dev": "NODE_ENV=development node --watch server.mjs",
+    "start": "NODE_ENV=production node server.mjs",
+    "test": "node --test test/*.test.mjs",
+    "test:live-stt": "node scripts/test-live-stt.mjs",
+    "benchmark:speakers": "node scripts/benchmark-speakers.mjs",
+    "migrate:speaker-encryption": "node scripts/migrate-speaker-encryption.mjs",
+    "migrate:postgres": "node scripts/migrate-sqlite-to-postgres.mjs",
+    "backup:data": "node scripts/backup-data.mjs",
+    "restore:data": "node scripts/restore-data.mjs"
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.8.0",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "multer": "^2.0.2",
+    "onnxruntime-web": "^1.27.0",
+    "pg": "^8.23.0",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": { "pg-mem": "^3.0.14" }
+}
