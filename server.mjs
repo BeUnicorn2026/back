@@ -415,6 +415,14 @@ app.put("/api/profile/vocabulary", requireTrustedOrigin, requireAuth, requireCsr
   response.json(await authStore.updateVocabulary(request.auth.user.id, request.body || {}));
 });
 
+app.get("/api/vocabulary/terms", requireAuth, requireOrganization, async (request, response) => {
+  const terms = await meetingStore.listVocabularyTerms(
+    request.auth.organization.id,
+    request.auth.user.vocabulary?.knownTerms || []
+  );
+  response.json({ terms });
+});
+
 app.get("/api/health", optionalAuth, async (request, response) => {
   const speakers = request.auth?.organization ? await speakerStore.list(request.auth.organization.id) : [];
   response.json({ ok: true, services: configuredServices(), speakerCount: speakers.length });
