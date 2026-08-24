@@ -5,7 +5,7 @@
   "type": "module",
   "engines": { "node": ">=22.13.0" },
   "scripts": {
-    "dev": "NODE_ENV=development node --watch server.mjs",
+    "dev": "NODE_ENV=development node server.mjs",
     "start": "NODE_ENV=production node server.mjs",
     "test": "node --test test/*.test.mjs",
     "test:live-stt": "node scripts/test-live-stt.mjs",

@@ -95,17 +95,21 @@ const sessionCookieName = "voice_partition_session";
 
 if (process.env.TRUST_PROXY) app.set("trust proxy", process.env.TRUST_PROXY === "true" ? 1 : process.env.TRUST_PROXY);
 
-function expectedOrigin(request) {
-  if (process.env.PUBLIC_ORIGIN) return process.env.PUBLIC_ORIGIN.replace(/\/$/, "");
+function requestOrigin(request) {
   const protocol = request.headers["x-forwarded-proto"]?.split(",", 1)[0]?.trim() || (request.socket.encrypted ? "https" : "http");
   return `${protocol}://${request.headers.host}`;
+}
+
+function allowedOrigins(request) {
+  const configured = String(process.env.PUBLIC_ORIGIN || "").split(",").map((value) => value.trim().replace(/\/$/, "")).filter(Boolean);
+  return configured.length ? configured : [requestOrigin(request)];
 }
 
 function hasTrustedOrigin(request) {
   const origin = request.headers.origin;
   if (!origin) return true;
   try {
-    return new URL(origin).origin === new URL(expectedOrigin(request)).origin;
+    return allowedOrigins(request).some((allowed) => new URL(origin).origin === new URL(allowed).origin);
   } catch {
     return false;
   }
@@ -206,9 +210,10 @@ function sessionToken(request) {
 }
 
 function setSessionCookie(response, token, expiresAt) {
+  const sameSite = ["lax", "strict", "none"].includes(process.env.SESSION_COOKIE_SAME_SITE) ? process.env.SESSION_COOKIE_SAME_SITE : "lax";
   response.cookie(sessionCookieName, token, {
     httpOnly: true,
-    sameSite: "lax",
+    sameSite,
     secure: process.env.NODE_ENV === "production",
     expires: new Date(expiresAt),
     path: "/"
@@ -216,9 +221,10 @@ function setSessionCookie(response, token, expiresAt) {
 }
 
 function clearSessionCookie(response) {
+  const sameSite = ["lax", "strict", "none"].includes(process.env.SESSION_COOKIE_SAME_SITE) ? process.env.SESSION_COOKIE_SAME_SITE : "lax";
   response.clearCookie(sessionCookieName, {
     httpOnly: true,
-    sameSite: "lax",
+    sameSite,
     secure: process.env.NODE_ENV === "production",
     path: "/"
   });
@@ -311,6 +317,20 @@ async function enrollProfile(pcm) {
 
 app.disable("x-powered-by");
 app.use(express.json({ limit: "64kb" }));
+app.use("/api", (request, response, next) => {
+  const origin = request.headers.origin;
+  if (origin && hasTrustedOrigin(request)) {
+    response.set("Access-Control-Allow-Origin", origin);
+    response.set("Access-Control-Allow-Credentials", "true");
+    response.set("Vary", "Origin");
+  }
+  if (request.method !== "OPTIONS") return next();
+  if (!origin || !hasTrustedOrigin(request)) return response.status(403).end();
+  response.set("Access-Control-Allow-Methods", "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS");
+  response.set("Access-Control-Allow-Headers", "Content-Type,X-CSRF-Token,X-Request-ID");
+  response.set("Access-Control-Max-Age", "600");
+  return response.status(204).end();
+});
 
 app.post("/api/auth/signup", requireTrustedOrigin, signupRateLimit, async (request, response) => {
   const user = await authStore.signup(request.body || {});
