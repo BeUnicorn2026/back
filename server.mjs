@@ -462,6 +462,18 @@ app.get("/api/vocabulary/terms", requireAuth, requireOrganization, async (reques
     request.auth.organization.id,
     request.auth.user.vocabulary?.knownTerms || []
   );
+  const privateConcepts = await knowledgeStore.list(request.auth.user.id);
+  const existing = new Set(terms.map(({ term }) => normalizeConceptLabel(term).toLocaleLowerCase("ko-KR")));
+  for (const concept of privateConcepts) {
+    const key = normalizeConceptLabel(concept.term).toLocaleLowerCase("ko-KR");
+    if (!existing.has(key)) {
+      terms.push({
+        term: concept.term, definition: "", explanation: "", personalizedExplanation: "",
+        occurrences: 0, meetingCount: 0, firstSeenAt: null, lastSeenAt: null, speakers: []
+      });
+      existing.add(key);
+    }
+  }
   response.json({ terms: await personalizedTermsFor(request.auth.user, terms) });
 });
 

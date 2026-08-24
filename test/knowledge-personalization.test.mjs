@@ -16,6 +16,7 @@ test("joins shared terms with only the requesting user's knowledge state", () =>
   assert.equal(result[0].term, "임베딩");
   assert.equal(result[0].shouldExplain, true);
   assert.match(result[0].personalizedExplanation, /^사용 흐름 관점/);
+  assert.match(result[0].personalizedExplanation, /쉽게 말해/);
   assert.equal(result[1].isKnown, true);
   assert.equal(result[1].shouldExplain, false);
   assert.equal("logOdds" in result[0].knowledge, false);
