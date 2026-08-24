@@ -637,7 +637,8 @@ app.post("/api/transcribe", requireTrustedOrigin, requireAuth, requireOrganizati
     const language = typeof request.body?.language === "string" ? request.body.language.trim() : "";
     if (language) form.append("language", language);
 
-    const knownSpeakers = (await speakerStore.loadProfiles(request.auth.organization.id)).slice(0, 4);
+    const allKnownSpeakers = await speakerStore.loadProfiles(request.auth.organization.id);
+    const knownSpeakers = allKnownSpeakers.slice(0, 4);
     const knownSpeakerReferences = [];
     for (const speaker of knownSpeakers) {
       knownSpeakerReferences.push(`data:audio/wav;base64,${speaker.referenceAudio.toString("base64")}`);
@@ -658,12 +659,12 @@ app.post("/api/transcribe", requireTrustedOrigin, requireAuth, requireOrganizati
       return response.status(openAIResponse.status).json({ error: payload?.error?.message || "음성을 전사하지 못했습니다." });
     }
     const normalized = normalizeTranscript(payload, { knownSpeakers: knownSpeakers.map(({ name }) => name) });
-    if (!knownSpeakers.length) return response.json(normalized);
+    if (!allKnownSpeakers.length) return response.json(normalized);
     try {
       const decoded = await decodeToPcm(request.file.buffer, 1_800);
       const pcm = new Int16Array(decoded.buffer, decoded.byteOffset, Math.floor(decoded.byteLength / 2));
       const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath);
-      const reconciled = await reconcileTranscriptSpeakers(normalized, pcm, knownSpeakers, model, {
+      const reconciled = await reconcileTranscriptSpeakers(normalized, pcm, allKnownSpeakers, model, {
         threshold: Number(process.env.SPEAKER_MATCH_THRESHOLD) || 0.72,
         margin: Number(process.env.SPEAKER_MATCH_MARGIN) || 0.04
       });
@@ -744,20 +745,16 @@ liveServer.on("connection", async (client, request, requestUrl) => {
     const identityTracker = mode === "speaker" ? new SpeakerIdentityTracker() : null;
     const recognitionFrames = [];
     const analyzedRegions = new Set();
-    let audioHistory = Buffer.alloc(0);
-    let audioHistoryStartSample = 0;
-    let totalSamples = 0;
+    const audioHistory = new PcmHistoryBuffer(speakerModelInfo.sampleRate * 90);
 
     const analyzeDiarizedRegions = async (words) => {
       for (const region of diarizedAudioRegions(words)) {
         const cacheKey = `${region.sourceSpeaker}:${region.start.toFixed(2)}:${region.end.toFixed(2)}`;
         if (analyzedRegions.has(cacheKey)) continue;
-        const firstSample = Math.max(audioHistoryStartSample, Math.floor(region.start * speakerModelInfo.sampleRate));
-        const lastSample = Math.min(totalSamples, Math.ceil(region.end * speakerModelInfo.sampleRate));
+        const firstSample = Math.max(audioHistory.earliestSample, Math.floor(region.start * speakerModelInfo.sampleRate));
+        const lastSample = Math.min(audioHistory.latestSample, Math.ceil(region.end * speakerModelInfo.sampleRate));
         if (lastSample - firstSample < speakerModelInfo.sampleRate) continue;
-        const firstByte = (firstSample - audioHistoryStartSample) * 2;
-        const lastByte = (lastSample - audioHistoryStartSample) * 2;
-        const snapshot = Buffer.from(audioHistory.subarray(firstByte, lastByte));
+        const snapshot = audioHistory.slice(firstSample, lastSample);
         try {
           const pcm = new Int16Array(snapshot.buffer, snapshot.byteOffset, snapshot.byteLength / 2);
           const inferenceQuality = analyzePcmQuality(pcm, speakerModelInfo.sampleRate);
@@ -870,15 +867,7 @@ liveServer.on("connection", async (client, request, requestUrl) => {
       const incoming = Buffer.from(data);
       deepgram.send(incoming);
       if (mode !== "speaker") return;
-      audioHistory = Buffer.concat([audioHistory, incoming]);
-      const receivedSamples = incoming.length / 2;
-      totalSamples += receivedSamples;
-      const maximumHistoryBytes = speakerModelInfo.sampleRate * 90 * 2;
-      if (audioHistory.length > maximumHistoryBytes) {
-        const removedBytes = audioHistory.length - maximumHistoryBytes;
-        audioHistory = audioHistory.subarray(removedBytes);
-        audioHistoryStartSample += removedBytes / 2;
-      }
+      audioHistory.append(incoming);
     });
   } catch (error) {
     console.error("Live session failed:", error);
