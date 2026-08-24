@@ -312,7 +312,7 @@ async function personalizedIntelligenceFor(user, intelligence) {
 }
 
 function publicKnowledgeExplanation(stored) {
-  return {
+  const explanation = {
     cacheKey: stored.cacheKey,
     conceptId: stored.conceptId,
     term: stored.term,
@@ -327,6 +327,15 @@ function publicKnowledgeExplanation(stored) {
     segmentIndex: stored.segmentIndex,
     generatedAt: stored.createdAt
   };
+  if (stored.answeredChoiceIndex != null) {
+    explanation.answer = {
+      choiceIndex: stored.answeredChoiceIndex,
+      correct: stored.answeredChoiceIndex === Number(stored.result.correctChoiceIndex),
+      rationale: stored.result.answerRationale,
+      answeredAt: stored.answeredAt
+    };
+  }
+  return explanation;
 }
 
 function pcmToWave(pcm, sampleRate = 16_000) {
@@ -620,26 +629,37 @@ app.post("/api/knowledge/explanations/:cacheKey/answer", requireTrustedOrigin, r
   knowledgeEvidenceRateLimit, async (request, response) => {
     const cacheKey = String(request.params.cacheKey || "");
     const choiceIndex = Number(request.body?.choiceIndex);
-    const eventId = String(request.body?.eventId || "").trim();
     if (!/^[a-f0-9]{64}$/.test(cacheKey)) return response.status(400).json({ error: "유효한 확인 질문 ID가 필요합니다." });
     if (!Number.isInteger(choiceIndex) || choiceIndex < 0 || choiceIndex > 2) {
       return response.status(400).json({ error: "답변 선택이 올바르지 않습니다." });
     }
-    if (!eventId || eventId.length > 120) return response.status(400).json({ error: "유효한 eventId가 필요합니다." });
-    const stored = await knowledgeStore.getExplanation(request.auth.user.id, cacheKey);
+    let stored = await knowledgeStore.getExplanation(request.auth.user.id, cacheKey);
     if (!stored) return response.status(404).json({ error: "확인 질문을 찾지 못했습니다." });
     const meeting = stored.meetingId
       ? await meetingStore.get(stored.meetingId, request.auth.organization.id)
       : null;
     if (!meeting) return response.status(404).json({ error: "확인 질문의 회의를 찾지 못했습니다." });
-    const correct = choiceIndex === Number(stored.result.correctChoiceIndex);
+    const claimed = await knowledgeStore.claimExplanationAnswer(request.auth.user.id, cacheKey, choiceIndex);
+    if (!claimed) stored = await knowledgeStore.getExplanation(request.auth.user.id, cacheKey);
+    const recordedChoice = claimed ? choiceIndex : stored.answeredChoiceIndex;
+    const correct = recordedChoice === Number(stored.result.correctChoiceIndex);
+    if (!claimed) {
+      return response.json({
+        correct,
+        choiceIndex: recordedChoice,
+        rationale: stored.result.answerRationale,
+        state: (await knowledgeStore.statesForTerms(request.auth.user.id, [stored.term],
+          request.auth.user.vocabulary?.knownTerms || [])).at(0),
+        duplicate: true
+      });
+    }
     const known = new Set((request.auth.user.vocabulary?.knownTerms || [])
       .map(normalizeConceptLabel).map((value) => value.toLocaleLowerCase("ko-KR")));
     const result = await knowledgeStore.recordEvidence({
       userId: request.auth.user.id,
       conceptLabel: stored.term,
       kind: correct ? "correct_answer" : "incorrect_answer",
-      eventId,
+      eventId: `quiz:${cacheKey}`,
       organizationId: request.auth.organization.id,
       meetingId: meeting.id,
       segmentIndex: stored.segmentIndex,
@@ -648,6 +668,7 @@ app.post("/api/knowledge/explanations/:cacheKey/answer", requireTrustedOrigin, r
     });
     response.status(result.duplicate ? 200 : 201).json({
       correct,
+      choiceIndex: recordedChoice,
       rationale: stored.result.answerRationale,
       state: result.state,
       duplicate: result.duplicate

@@ -65,6 +65,9 @@ test("caches generated explanations privately and removes them with the concept"
   assert.equal(saved.segmentIndex, 2);
   assert.equal(await store.getExplanation("user-b", cacheKey), null);
   assert.equal((await store.getExplanation("user-a", cacheKey)).term, "임베딩");
+  assert.equal(await store.claimExplanationAnswer("user-a", cacheKey, 1), true);
+  assert.equal(await store.claimExplanationAnswer("user-a", cacheKey, 0), false);
+  assert.equal((await store.getExplanation("user-a", cacheKey)).answeredChoiceIndex, 1);
   assert.equal(await store.remove("user-a", saved.conceptId), true);
   assert.equal(await store.getExplanation("user-a", cacheKey), null);
 });
