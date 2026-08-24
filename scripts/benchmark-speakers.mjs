@@ -3,7 +3,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { analyzePcmQuality } from "../lib/audio-quality.mjs";
-import { getSpeakerEmbeddingModel } from "../lib/speaker-embedding-model.mjs";
+import { getSpeakerEmbeddingModel, mergeSpeakerProfileVectors } from "../lib/speaker-embedding-model.mjs";
 import { assessBenchmarkCoverage, calibrateSpeakerThreshold, evaluateSpeakerTrials } from "../lib/speaker-evaluation.mjs";
 
 const argumentsList = process.argv.slice(2);
@@ -81,7 +81,14 @@ for (const speaker of manifest.speakers) {
     profiles.push(profile.centroid, ...profile.exemplars);
     enrollmentQuality.push({ speakerId: speaker.id, file: relativeFile, quality, consistency: profile.consistency });
   }
-  speakers.push({ id: speaker.id, name: speaker.name, profiles });
+  const merged = mergeSpeakerProfileVectors([profiles]);
+  speakers.push({
+    id: speaker.id,
+    name: speaker.name,
+    profiles: merged.vectors,
+    enrollmentConsistency: merged.consistency,
+    matchThreshold: merged.matchThreshold
+  });
 }
 
 const trials = [];
@@ -102,15 +109,26 @@ for (const probe of manifest.probes) {
 
 const threshold = Number(manifest.threshold ?? 0.72);
 const margin = Number(manifest.margin ?? 0.04);
+const coverage = assessBenchmarkCoverage(trials, speakers, Number(manifest.minimumProbesPerClass) || 5);
+const calibration = coverage.ready
+  ? calibrateSpeakerThreshold(trials, speakers, {
+    minimum: Number(manifest.calibration?.minimumThreshold ?? 0.55),
+    maximum: Number(manifest.calibration?.maximumThreshold ?? 0.9),
+    step: Number(manifest.calibration?.thresholdStep ?? 0.01),
+    minimumMargin: Number(manifest.calibration?.minimumMargin ?? 0.02),
+    maximumMargin: Number(manifest.calibration?.maximumMargin ?? 0.12),
+    marginStep: Number(manifest.calibration?.marginStep ?? 0.01)
+  })
+  : { ready: false, reason: "보정값을 제안하려면 coverage 경고를 먼저 해소해야 합니다." };
 const report = {
   generatedAt: new Date().toISOString(),
   model: "Xenova/wavlm-base-plus-sv",
   dataset: { speakers: speakers.length, probes: trials.length },
-  coverage: assessBenchmarkCoverage(trials, speakers, Number(manifest.minimumProbesPerClass) || 5),
+  coverage,
   enrollmentQuality,
   probeQuality,
   current: evaluateSpeakerTrials(trials, speakers, { threshold, margin }),
-  calibration: calibrateSpeakerThreshold(trials, speakers, { margin })
+  calibration
 };
 const serialized = `${JSON.stringify(report, null, 2)}\n`;
 const outputPath = valueAfter("--output");

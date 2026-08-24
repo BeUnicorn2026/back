@@ -24,7 +24,13 @@ test("calibrates only when genuine and unknown trials both exist", () => {
   const calibrated = calibrateSpeakerThreshold(trials, speakers);
   assert.equal(calibrated.ready, true);
   assert.ok(calibrated.threshold >= 0.55 && calibrated.threshold <= 0.9);
+  assert.ok(calibrated.margin >= 0.02 && calibrated.margin <= 0.12);
   assert.equal(calibrateSpeakerThreshold(trials.filter(({ expectedSpeakerId }) => expectedSpeakerId), speakers).ready, false);
+});
+
+test("can preserve a fixed margin or reject an invalid calibration range", () => {
+  assert.equal(calibrateSpeakerThreshold(trials, speakers, { margin: 0.07 }).margin, 0.07);
+  assert.throws(() => calibrateSpeakerThreshold(trials, speakers, { minimumMargin: 0.1, maximumMargin: 0.05 }), /범위/);
 });
 
 test("marks undersized benchmark datasets as insufficient evidence", () => {
