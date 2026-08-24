@@ -525,7 +525,7 @@ app.post("/api/meetings/:id/intelligence", requireTrustedOrigin, requireAuth, re
       if (cached) return response.json({ intelligence: cached, cached: true });
     }
     try {
-      const result = await meetingIntelligenceService.analyze(meeting, request.auth.user.vocabulary || {});
+      const result = await meetingIntelligenceService.analyze(meeting);
       const intelligence = await meetingStore.saveIntelligence({
         meetingId: meeting.id,
         organizationId: request.auth.organization.id,
