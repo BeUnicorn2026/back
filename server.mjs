@@ -25,6 +25,10 @@ import { PostgresRequestRateLimiter } from "./lib/postgres-rate-limiter.mjs";
 import { MeetingIntelligenceService, transcriptHash } from "./lib/meeting-intelligence.mjs";
 import { PcmHistoryBuffer } from "./lib/pcm-history-buffer.mjs";
 import { buildSttKeyterms } from "./lib/stt-keyterms.mjs";
+import { KnowledgeStore } from "./lib/knowledge-store.mjs";
+import { PostgresKnowledgeStore } from "./lib/postgres-knowledge-store.mjs";
+import { knowledgeTwinDefaults, normalizeConceptLabel } from "./lib/knowledge-twin.mjs";
+import { personalizeKnowledgeTerms } from "./lib/knowledge-personalization.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 3001;
@@ -64,6 +68,9 @@ const speakerStore = speakerStorageMode === "vercel-blob"
 const meetingStore = postgresDatabase
   ? new PostgresMeetingStore(postgresDatabase)
   : new MeetingStore(path.join(dataDirectory, "meetings"), { databasePath });
+const knowledgeStore = postgresDatabase
+  ? new PostgresKnowledgeStore(postgresDatabase)
+  : new KnowledgeStore(databasePath);
 const requestRateLimiter = postgresDatabase
   ? new PostgresRequestRateLimiter(postgresDatabase)
   : new RequestRateLimiter(databasePath);
@@ -185,6 +192,8 @@ const meetingAnalysisRateLimit = rateLimit("meeting-analysis", { limit: 12, wind
   `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
 const speakerEnrollmentRateLimit = rateLimit("speaker-enrollment", { limit: 12, windowMs: 60 * 60_000 }, (request) =>
   `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
+const knowledgeEvidenceRateLimit = rateLimit("knowledge-evidence", { limit: 240, windowMs: 60 * 60_000 }, (request) =>
+  request.auth?.user?.id || request.ip);
 
 app.use((request, response, next) => {
   const startedAt = performance.now();
@@ -278,8 +287,20 @@ function configuredServices() {
     database: databaseMode,
     speakerStorage: speakerStorageMode,
     speakerModel: speakerModelInfo.id,
-    speakerModelState
+    speakerModelState,
+    knowledgeTwin: "evidence-v1"
   };
+}
+
+async function personalizedTermsFor(user, terms) {
+  const knownTerms = user.vocabulary?.knownTerms || [];
+  const states = await knowledgeStore.statesForTerms(user.id, terms.map(({ term }) => term), knownTerms);
+  return personalizeKnowledgeTerms(terms, states, user.vocabulary?.roles || []);
+}
+
+async function personalizedIntelligenceFor(user, intelligence) {
+  if (!intelligence) return null;
+  return { ...intelligence, terms: await personalizedTermsFor(user, intelligence.terms || []) };
 }
 
 function pcmToWave(pcm, sampleRate = 16_000) {
@@ -441,7 +462,63 @@ app.get("/api/vocabulary/terms", requireAuth, requireOrganization, async (reques
     request.auth.organization.id,
     request.auth.user.vocabulary?.knownTerms || []
   );
-  response.json({ terms });
+  response.json({ terms: await personalizedTermsFor(request.auth.user, terms) });
+});
+
+app.get("/api/knowledge", requireAuth, async (request, response) => {
+  const stored = await knowledgeStore.list(request.auth.user.id);
+  const priors = await knowledgeStore.statesForTerms(
+    request.auth.user.id,
+    request.auth.user.vocabulary?.knownTerms || [],
+    request.auth.user.vocabulary?.knownTerms || []
+  );
+  const concepts = new Map([...priors, ...stored].map((state) => [state.conceptId, state]));
+  response.json({ concepts: [...concepts.values()] });
+});
+
+app.post("/api/knowledge/evidence", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
+  knowledgeEvidenceRateLimit, async (request, response) => {
+    const allowedClientKinds = new Set([
+      "mark_known", "mark_unknown", "request_simpler", "card_open", "correct_answer", "incorrect_answer"
+    ]);
+    const kind = String(request.body?.kind || "");
+    if (!allowedClientKinds.has(kind)) return response.status(400).json({ error: "지원하지 않는 지식 피드백입니다." });
+    const term = normalizeConceptLabel(request.body?.term);
+    if (!term) return response.status(400).json({ error: "피드백할 용어가 필요합니다." });
+    const eventId = String(request.body?.eventId || "").trim();
+    if (!eventId || eventId.length > 120) return response.status(400).json({ error: "유효한 eventId가 필요합니다." });
+    const meetingId = request.body?.meetingId ? String(request.body.meetingId) : null;
+    let segmentIndex = request.body?.segmentIndex == null ? null : Number(request.body.segmentIndex);
+    if (meetingId) {
+      const meeting = await meetingStore.get(meetingId, request.auth.organization.id);
+      if (!meeting) return response.status(404).json({ error: "지식 피드백의 회의를 찾지 못했습니다." });
+      if (segmentIndex != null && (!Number.isInteger(segmentIndex) || segmentIndex < 0 || segmentIndex >= meeting.segments.length)) {
+        return response.status(400).json({ error: "지식 피드백의 발화 위치가 올바르지 않습니다." });
+      }
+    } else {
+      segmentIndex = null;
+    }
+    const known = new Set((request.auth.user.vocabulary?.knownTerms || [])
+      .map(normalizeConceptLabel).map((value) => value.toLocaleLowerCase("ko-KR")));
+    const result = await knowledgeStore.recordEvidence({
+      userId: request.auth.user.id,
+      conceptLabel: term,
+      kind,
+      eventId,
+      organizationId: request.auth.organization.id,
+      meetingId,
+      segmentIndex,
+      prior: known.has(term.toLocaleLowerCase("ko-KR")) ? knowledgeTwinDefaults.knownPrior : knowledgeTwinDefaults.prior
+    });
+    response.status(result.duplicate ? 200 : 201).json(result);
+  });
+
+app.delete("/api/knowledge/:conceptId", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
+  if (!/^concept_[a-f0-9]{32}$/.test(request.params.conceptId)) {
+    return response.status(400).json({ error: "유효한 개념 ID가 필요합니다." });
+  }
+  await knowledgeStore.remove(request.auth.user.id, request.params.conceptId);
+  response.status(204).end();
 });
 
 app.get("/api/health", optionalAuth, async (request, response) => {
@@ -511,7 +588,8 @@ app.get("/api/meetings/:id/intelligence", requireAuth, requireOrganization, asyn
   const meeting = await meetingStore.get(request.params.id, request.auth.organization.id);
   if (!meeting) return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
   const hash = transcriptHash(meeting.segments);
-  response.json({ intelligence: await meetingStore.getIntelligence(meeting.id, request.auth.organization.id, hash) });
+  const intelligence = await meetingStore.getIntelligence(meeting.id, request.auth.organization.id, hash);
+  response.json({ intelligence: await personalizedIntelligenceFor(request.auth.user, intelligence) });
 });
 
 app.post("/api/meetings/:id/intelligence", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
@@ -522,7 +600,7 @@ app.post("/api/meetings/:id/intelligence", requireTrustedOrigin, requireAuth, re
     const hash = transcriptHash(meeting.segments);
     if (!request.body?.force) {
       const cached = await meetingStore.getIntelligence(meeting.id, request.auth.organization.id, hash);
-      if (cached) return response.json({ intelligence: cached, cached: true });
+      if (cached) return response.json({ intelligence: await personalizedIntelligenceFor(request.auth.user, cached), cached: true });
     }
     try {
       const result = await meetingIntelligenceService.analyze(meeting);
@@ -534,7 +612,7 @@ app.post("/api/meetings/:id/intelligence", requireTrustedOrigin, requireAuth, re
         model: result.model,
         result
       });
-      return response.json({ intelligence, cached: false });
+      return response.json({ intelligence: await personalizedIntelligenceFor(request.auth.user, intelligence), cached: false });
     } catch (error) {
       console.error("Meeting intelligence failed:", error);
       return response.status(error?.name === "AbortError" ? 504 : 502).json({
@@ -725,7 +803,9 @@ app.use((error, _request, response, _next) => {
   return response.status(400).json({ error: "요청을 처리할 수 없습니다." });
 });
 
-await Promise.all([authStore.initialize(), speakerStore.initialize(), meetingStore.initialize(), requestRateLimiter.initialize()]);
+await Promise.all([
+  authStore.initialize(), speakerStore.initialize(), meetingStore.initialize(), knowledgeStore.initialize(), requestRateLimiter.initialize()
+]);
 const server = app.listen(port, () => {
   console.log(`Voice Partition is running at http://localhost:${port}`);
 });
