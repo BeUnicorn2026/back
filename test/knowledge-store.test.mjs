@@ -49,3 +49,22 @@ test("dampens repeated weak observations using persisted same-kind counts", asyn
   assert.equal(second.state.evidenceCount, 2);
   assert.ok(first.state.pKnown - second.state.pKnown < 0.03);
 });
+
+test("caches generated explanations privately and removes them with the concept", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "knowledge-explanation-store-"));
+  context.after(() => closeSqliteDatabases());
+  const store = new KnowledgeStore(path.join(root, "knowledge.sqlite"));
+  const cacheKey = "a".repeat(64);
+  await store.recordEvidence({ userId: "user-a", conceptLabel: "임베딩", kind: "card_open", eventId: "open-cache" });
+  const saved = await store.saveExplanation({
+    userId: "user-a", cacheKey, conceptLabel: "임베딩", level: "simple",
+    result: { explanation: "쉬운 설명", correctChoiceIndex: 1 }, source: "openai", model: "test-model",
+    meetingId: "meeting-a", segmentIndex: 2
+  });
+  assert.equal(saved.result.correctChoiceIndex, 1);
+  assert.equal(saved.segmentIndex, 2);
+  assert.equal(await store.getExplanation("user-b", cacheKey), null);
+  assert.equal((await store.getExplanation("user-a", cacheKey)).term, "임베딩");
+  assert.equal(await store.remove("user-a", saved.conceptId), true);
+  assert.equal(await store.getExplanation("user-a", cacheKey), null);
+});

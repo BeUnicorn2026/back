@@ -121,5 +121,13 @@ test("PostgreSQL knowledge store keeps evidence idempotent and user-private", as
     assert.equal(duplicate.state.evidenceCount, 1);
     assert.equal((await store.list("user-b")).length, 0);
     assert.equal((await store.statesForTerms("user-a", ["임베딩"], [])).at(0).source, "evidence");
+    const cacheKey = "b".repeat(64);
+    const saved = await store.saveExplanation({
+      userId: "user-a", cacheKey, conceptLabel: "임베딩", level: "simple",
+      result: { explanation: "개인 설명", correctChoiceIndex: 2 }, source: "local"
+    });
+    assert.equal(saved.result.correctChoiceIndex, 2);
+    assert.equal(await store.getExplanation("user-b", cacheKey), null);
+    assert.equal((await store.getExplanation("user-a", cacheKey)).term, "임베딩");
   });
 });

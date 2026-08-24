@@ -29,6 +29,7 @@ import { KnowledgeStore } from "./lib/knowledge-store.mjs";
 import { PostgresKnowledgeStore } from "./lib/postgres-knowledge-store.mjs";
 import { knowledgeTwinDefaults, normalizeConceptLabel } from "./lib/knowledge-twin.mjs";
 import { personalizeKnowledgeTerms } from "./lib/knowledge-personalization.mjs";
+import { KnowledgeExplanationService, knowledgeExplanationCacheKey } from "./lib/knowledge-explanation.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 3001;
@@ -83,6 +84,10 @@ emailService.assertConfigured();
 const meetingIntelligenceService = new MeetingIntelligenceService({
   apiKey: process.env.OPENAI_API_KEY,
   model: process.env.OPENAI_ANALYSIS_MODEL
+});
+const knowledgeExplanationService = new KnowledgeExplanationService({
+  apiKey: process.env.OPENAI_API_KEY,
+  model: process.env.OPENAI_EXPLANATION_MODEL || process.env.OPENAI_ANALYSIS_MODEL
 });
 const speakerModelCache = process.env.SPEAKER_MODEL_CACHE || path.join(projectDirectory, ".cache", "speaker-models");
 const speakerModelPath = process.env.SPEAKER_MODEL_PATH || "";
@@ -194,6 +199,8 @@ const speakerEnrollmentRateLimit = rateLimit("speaker-enrollment", { limit: 12, 
   `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
 const knowledgeEvidenceRateLimit = rateLimit("knowledge-evidence", { limit: 240, windowMs: 60 * 60_000 }, (request) =>
   request.auth?.user?.id || request.ip);
+const knowledgeExplanationRateLimit = rateLimit("knowledge-explanation", { limit: 30, windowMs: 60 * 60_000 }, (request) =>
+  request.auth?.user?.id || request.ip);
 
 app.use((request, response, next) => {
   const startedAt = performance.now();
@@ -284,6 +291,7 @@ function configuredServices() {
     biometricEncryption: Boolean(process.env.VOICE_BIOMETRIC_KEY),
     email: emailService.mode,
     meetingIntelligence: meetingIntelligenceService.mode,
+    knowledgeExplanation: knowledgeExplanationService.mode,
     database: databaseMode,
     speakerStorage: speakerStorageMode,
     speakerModel: speakerModelInfo.id,
@@ -301,6 +309,24 @@ async function personalizedTermsFor(user, terms) {
 async function personalizedIntelligenceFor(user, intelligence) {
   if (!intelligence) return null;
   return { ...intelligence, terms: await personalizedTermsFor(user, intelligence.terms || []) };
+}
+
+function publicKnowledgeExplanation(stored) {
+  return {
+    cacheKey: stored.cacheKey,
+    conceptId: stored.conceptId,
+    term: stored.term,
+    level: stored.level,
+    explanation: stored.result.explanation,
+    analogy: stored.result.analogy,
+    checkQuestion: stored.result.checkQuestion,
+    choices: stored.result.choices,
+    source: stored.source,
+    model: stored.model,
+    meetingId: stored.meetingId,
+    segmentIndex: stored.segmentIndex,
+    generatedAt: stored.createdAt
+  };
 }
 
 function pcmToWave(pcm, sampleRate = 16_000) {
@@ -491,7 +517,7 @@ app.get("/api/knowledge", requireAuth, async (request, response) => {
 app.post("/api/knowledge/evidence", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
   knowledgeEvidenceRateLimit, async (request, response) => {
     const allowedClientKinds = new Set([
-      "mark_known", "mark_unknown", "request_simpler", "card_open", "correct_answer", "incorrect_answer"
+      "mark_known", "mark_unknown", "request_simpler", "card_open"
     ]);
     const kind = String(request.body?.kind || "");
     if (!allowedClientKinds.has(kind)) return response.status(400).json({ error: "지원하지 않는 지식 피드백입니다." });
@@ -523,6 +549,109 @@ app.post("/api/knowledge/evidence", requireTrustedOrigin, requireAuth, requireOr
       prior: known.has(term.toLocaleLowerCase("ko-KR")) ? knowledgeTwinDefaults.knownPrior : knowledgeTwinDefaults.prior
     });
     response.status(result.duplicate ? 200 : 201).json(result);
+  });
+
+app.post("/api/knowledge/explanations", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
+  knowledgeExplanationRateLimit, async (request, response) => {
+    const meetingId = String(request.body?.meetingId || "").trim();
+    const requestedTerm = normalizeConceptLabel(request.body?.term);
+    const level = ["simple", "standard", "deep"].includes(request.body?.level) ? request.body.level : "simple";
+    if (!meetingId || !requestedTerm) return response.status(400).json({ error: "회의와 용어가 필요합니다." });
+    const meeting = await meetingStore.get(meetingId, request.auth.organization.id);
+    if (!meeting) return response.status(404).json({ error: "맞춤 해설의 회의를 찾지 못했습니다." });
+    const hash = transcriptHash(meeting.segments);
+    const intelligence = await meetingStore.getIntelligence(meeting.id, request.auth.organization.id, hash);
+    if (!intelligence) return response.status(409).json({ error: "먼저 회의 구조 분석을 완료해 주세요." });
+    const requestedKey = requestedTerm.toLocaleLowerCase("ko-KR");
+    const analyzedTerm = (intelligence.terms || []).find(({ term }) =>
+      normalizeConceptLabel(term).toLocaleLowerCase("ko-KR") === requestedKey);
+    const definition = String(analyzedTerm?.definition || analyzedTerm?.explanation || "").trim();
+    if (!analyzedTerm || !definition) {
+      return response.status(404).json({ error: "검증된 회의 용어 정의를 찾지 못했습니다." });
+    }
+    const fallbackIndex = Number(analyzedTerm.evidenceSegmentIndex);
+    const requestedIndex = request.body?.segmentIndex == null ? fallbackIndex : Number(request.body.segmentIndex);
+    const segmentIndex = Number.isInteger(requestedIndex) && requestedIndex >= 0 && requestedIndex < meeting.segments.length
+      ? requestedIndex : null;
+    const context = segmentIndex == null ? "" : String(meeting.segments[segmentIndex]?.text || "").trim();
+    const roles = request.auth.user.vocabulary?.roles || [];
+    const cacheKey = knowledgeExplanationCacheKey({
+      term: analyzedTerm.term,
+      definition,
+      context,
+      roles,
+      level,
+      model: `${knowledgeExplanationService.mode}:${knowledgeExplanationService.model}`
+    });
+    const cached = await knowledgeStore.getExplanation(request.auth.user.id, cacheKey);
+    if (cached) return response.json({ explanation: publicKnowledgeExplanation(cached), cached: true });
+    try {
+      const result = await knowledgeExplanationService.generate({
+        userId: request.auth.user.id,
+        term: analyzedTerm.term,
+        definition,
+        context,
+        roles,
+        level
+      });
+      const stored = await knowledgeStore.saveExplanation({
+        userId: request.auth.user.id,
+        cacheKey,
+        conceptLabel: analyzedTerm.term,
+        level,
+        result,
+        source: result.source,
+        model: result.model,
+        meetingId: meeting.id,
+        segmentIndex
+      });
+      return response.status(201).json({ explanation: publicKnowledgeExplanation(stored), cached: false });
+    } catch (error) {
+      console.error("Knowledge explanation failed:", error);
+      return response.status(error?.name === "AbortError" ? 504 : 502).json({
+        error: error?.name === "AbortError"
+          ? "맞춤 해설 생성 시간이 초과되었습니다."
+          : "맞춤 해설을 생성하지 못했습니다. 잠시 후 다시 시도해 주세요."
+      });
+    }
+  });
+
+app.post("/api/knowledge/explanations/:cacheKey/answer", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
+  knowledgeEvidenceRateLimit, async (request, response) => {
+    const cacheKey = String(request.params.cacheKey || "");
+    const choiceIndex = Number(request.body?.choiceIndex);
+    const eventId = String(request.body?.eventId || "").trim();
+    if (!/^[a-f0-9]{64}$/.test(cacheKey)) return response.status(400).json({ error: "유효한 확인 질문 ID가 필요합니다." });
+    if (!Number.isInteger(choiceIndex) || choiceIndex < 0 || choiceIndex > 2) {
+      return response.status(400).json({ error: "답변 선택이 올바르지 않습니다." });
+    }
+    if (!eventId || eventId.length > 120) return response.status(400).json({ error: "유효한 eventId가 필요합니다." });
+    const stored = await knowledgeStore.getExplanation(request.auth.user.id, cacheKey);
+    if (!stored) return response.status(404).json({ error: "확인 질문을 찾지 못했습니다." });
+    const meeting = stored.meetingId
+      ? await meetingStore.get(stored.meetingId, request.auth.organization.id)
+      : null;
+    if (!meeting) return response.status(404).json({ error: "확인 질문의 회의를 찾지 못했습니다." });
+    const correct = choiceIndex === Number(stored.result.correctChoiceIndex);
+    const known = new Set((request.auth.user.vocabulary?.knownTerms || [])
+      .map(normalizeConceptLabel).map((value) => value.toLocaleLowerCase("ko-KR")));
+    const result = await knowledgeStore.recordEvidence({
+      userId: request.auth.user.id,
+      conceptLabel: stored.term,
+      kind: correct ? "correct_answer" : "incorrect_answer",
+      eventId,
+      organizationId: request.auth.organization.id,
+      meetingId: meeting.id,
+      segmentIndex: stored.segmentIndex,
+      prior: known.has(stored.term.toLocaleLowerCase("ko-KR"))
+        ? knowledgeTwinDefaults.knownPrior : knowledgeTwinDefaults.prior
+    });
+    response.status(result.duplicate ? 200 : 201).json({
+      correct,
+      rationale: stored.result.answerRationale,
+      state: result.state,
+      duplicate: result.duplicate
+    });
   });
 
 app.delete("/api/knowledge/:conceptId", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
