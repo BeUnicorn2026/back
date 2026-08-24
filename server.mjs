@@ -79,6 +79,24 @@ const meetingIntelligenceService = new MeetingIntelligenceService({
 });
 const speakerModelCache = process.env.SPEAKER_MODEL_CACHE || path.join(projectDirectory, ".cache", "speaker-models");
 const speakerModelPath = process.env.SPEAKER_MODEL_PATH || "";
+const shouldPreloadSpeakerModel = process.env.PRELOAD_SPEAKER_MODEL === "true"
+  || (process.env.NODE_ENV === "production" && process.env.PRELOAD_SPEAKER_MODEL !== "false");
+let speakerModelState = "idle";
+let speakerModelFailure = null;
+
+async function prepareSpeakerModel() {
+  if (speakerModelState !== "ready") speakerModelState = "loading";
+  try {
+    const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath);
+    speakerModelState = "ready";
+    speakerModelFailure = null;
+    return model;
+  } catch (error) {
+    speakerModelState = "failed";
+    speakerModelFailure = error;
+    throw error;
+  }
+}
 const maxAudioBytes = 25 * 1024 * 1024;
 const supportedMimeTypes = new Set([
   "audio/flac", "audio/m4a", "audio/mp3", "audio/mp4", "audio/mpeg",
@@ -259,7 +277,8 @@ function configuredServices() {
     meetingIntelligence: meetingIntelligenceService.mode,
     database: databaseMode,
     speakerStorage: speakerStorageMode,
-    speakerModel: speakerModelInfo.id
+    speakerModel: speakerModelInfo.id,
+    speakerModelState
   };
 }
 
@@ -304,7 +323,7 @@ function decodeToPcm(input, maximumSeconds = 30) {
 }
 
 async function enrollProfile(pcm) {
-  const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath);
+  const model = await prepareSpeakerModel();
   const samples = new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2));
   const profile = await model.createProfile(samples);
   const vectors = [profile.centroid, ...profile.exemplars];
@@ -440,13 +459,16 @@ app.get("/api/health/ready", async (_request, response) => {
     else (await openSqliteDatabase(databasePath)).prepare("SELECT 1").get();
     const deepgramConfigured = Boolean(process.env.DEEPGRAM_API_KEY);
     const emailConfigured = emailService.mode === "resend" || process.env.NODE_ENV !== "production";
-    const ready = process.env.NODE_ENV !== "production" || (deepgramConfigured && emailConfigured);
+    const speakerModelReady = !shouldPreloadSpeakerModel || speakerModelState === "ready";
+    const ready = process.env.NODE_ENV !== "production" || (deepgramConfigured && emailConfigured && speakerModelReady);
     response.status(ready ? 200 : 503).json({
       ok: ready,
       status: ready ? "ready" : "degraded",
       database: `${databaseMode}:ready`,
       deepgram: deepgramConfigured ? "configured" : "missing",
-      email: emailConfigured ? emailService.mode : "missing"
+      email: emailConfigured ? emailService.mode : "missing",
+      speakerModel: speakerModelState,
+      ...(speakerModelFailure ? { speakerModelError: "모델을 준비하지 못했습니다." } : {})
     });
   } catch (error) {
     response.status(503).json({ ok: false, status: "unavailable", database: "unavailable" });
@@ -707,6 +729,11 @@ await Promise.all([authStore.initialize(), speakerStore.initialize(), meetingSto
 const server = app.listen(port, () => {
   console.log(`Voice Partition is running at http://localhost:${port}`);
 });
+if (shouldPreloadSpeakerModel) {
+  prepareSpeakerModel()
+    .then(() => console.log(JSON.stringify({ level: "info", event: "speaker_model_ready", model: speakerModelInfo.id })))
+    .catch((error) => console.error(JSON.stringify({ level: "error", event: "speaker_model_failed", message: error.message })));
+}
 
 const liveServer = new WebSocketServer({ noServer: true });
 
@@ -740,7 +767,29 @@ liveServer.on("connection", async (client, request, requestUrl) => {
     if (mode === "speaker" && speakers.some(({ profiles }) => profiles.some((profile) => profile.length !== speakerModelInfo.dimensions))) {
       throw new Error("이전 방식으로 등록된 목소리가 있습니다. 삭제하고 다시 등록해 주세요.");
     }
-    const speakerModel = mode === "speaker" ? await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath) : null;
+    let preparationTimer = null;
+    if (mode === "speaker" && speakerModelState !== "ready" && client.readyState === WebSocket.OPEN) {
+      const preparationStartedAt = Date.now();
+      const sendPreparationProgress = () => {
+        if (client.readyState !== WebSocket.OPEN) return;
+        const elapsedSeconds = Math.floor((Date.now() - preparationStartedAt) / 1000);
+        client.send(JSON.stringify({
+          type: "preparing",
+          elapsedSeconds,
+          message: elapsedSeconds
+            ? `화자 인식 모델 준비 중 · ${elapsedSeconds}초 경과`
+            : "화자 인식 모델을 준비하고 있습니다. 첫 실행은 최대 2분 정도 걸릴 수 있습니다."
+        }));
+      };
+      sendPreparationProgress();
+      preparationTimer = setInterval(sendPreparationProgress, 15_000);
+    }
+    let speakerModel = null;
+    try {
+      speakerModel = mode === "speaker" ? await prepareSpeakerModel() : null;
+    } finally {
+      if (preparationTimer) clearInterval(preparationTimer);
+    }
     const profiles = speakers.map(({ profiles: candidates }) => candidates);
     const identityTracker = mode === "speaker" ? new SpeakerIdentityTracker() : null;
     const recognitionFrames = [];

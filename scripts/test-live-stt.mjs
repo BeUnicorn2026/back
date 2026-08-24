@@ -7,6 +7,8 @@ const baseUrl = process.env.STT_TEST_URL || "http://localhost:3000";
 const email = process.env.STT_TEST_EMAIL;
 const password = process.env.STT_TEST_PASSWORD;
 const mode = process.env.STT_TEST_MODE === "speaker" ? "speaker" : "stt";
+const expectedSpeaker = String(process.env.STT_EXPECTED_SPEAKER || "").trim();
+const testStartedAt = performance.now();
 
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
   console.log(`Usage: STT_TEST_EMAIL=... STT_TEST_PASSWORD=... npm run test:live-stt -- <audio-file>
@@ -15,7 +17,8 @@ Options:
   STT_TEST_URL       Service URL (default: http://localhost:3000)
   STT_TEST_EMAIL     Existing account email
   STT_TEST_PASSWORD  Existing account password
-  STT_TEST_MODE      stt (default) or speaker`);
+  STT_TEST_MODE      stt (default) or speaker
+  STT_EXPECTED_SPEAKER  Speaker name required in speaker-mode output`);
   process.exit(0);
 }
 
@@ -47,6 +50,7 @@ const login = await fetch(new URL("/api/auth/login", baseUrl), {
   body: JSON.stringify({ email, password })
 });
 if (!login.ok) throw new Error(`로그인 실패: ${login.status} ${await login.text()}`);
+const loginCompletedAt = performance.now();
 const cookie = (login.headers.getSetCookie?.() || [login.headers.get("set-cookie")]).filter(Boolean)
   .map((value) => value.split(";", 1)[0]).join("; ");
 const pcm = await decodeToPcm(await readFile(audioPath));
@@ -57,10 +61,14 @@ socketUrl.protocol = socketUrl.protocol === "https:" ? "wss:" : "ws:";
 const result = await new Promise((resolve, reject) => {
   const socket = new WebSocket(socketUrl, { headers: { Cookie: cookie } });
   const finalSegments = [];
+  const preparationUpdates = [];
+  let readyAt = null;
+  let firstFinalAt = null;
+  const maximumWait = mode === "speaker" ? 150_000 : 45_000;
   const timeout = setTimeout(() => {
     socket.close();
-    reject(new Error("실시간 STT 테스트가 45초 안에 끝나지 않았습니다."));
-  }, 45_000);
+    reject(new Error(`실시간 ${mode === "speaker" ? "화자 식별" : "STT"} 테스트가 ${maximumWait / 1000}초 안에 끝나지 않았습니다.`));
+  }, maximumWait);
 
   socket.on("message", async (raw) => {
     const event = JSON.parse(raw.toString());
@@ -70,15 +78,20 @@ const result = await new Promise((resolve, reject) => {
       return reject(new Error(event.message));
     }
     if (event.type !== "ready") {
-      if (event.type === "transcript" && event.isFinal) finalSegments.push(...(event.segments || []));
+      if (event.type === "preparing") preparationUpdates.push(event.elapsedSeconds || 0);
+      if (event.type === "transcript" && event.isFinal) {
+        firstFinalAt ||= performance.now();
+        finalSegments.push(...(event.segments || []));
+      }
       if (event.type === "finalized") {
         clearTimeout(timeout);
         socket.close(1000, "test complete");
-        resolve(finalSegments);
+        resolve({ finalSegments, preparationUpdates, readyAt, firstFinalAt, finalizedAt: performance.now() });
       }
       return;
     }
     if (event.mode !== mode) return reject(new Error(`예상하지 않은 모드: ${event.mode}`));
+    readyAt = performance.now();
     for (let offset = 0; offset < pcm.length; offset += 3_200) {
       socket.send(pcm.subarray(offset, offset + 3_200));
       await delay(100);
@@ -88,5 +101,20 @@ const result = await new Promise((resolve, reject) => {
   socket.on("error", reject);
 });
 
-if (!result.length) throw new Error("확정된 STT 결과가 없습니다.");
-console.log(JSON.stringify({ mode, finalSegments: result }, null, 2));
+if (!result.finalSegments.length) throw new Error("확정된 STT 결과가 없습니다.");
+if (expectedSpeaker && !result.finalSegments.some(({ speaker }) => speaker === expectedSpeaker)) {
+  throw new Error(`예상 화자 ${expectedSpeaker}를 식별하지 못했습니다: ${result.finalSegments.map(({ speaker }) => speaker).join(", ")}`);
+}
+const milliseconds = (value) => value == null ? null : Math.round(value - testStartedAt);
+console.log(JSON.stringify({
+  mode,
+  expectedSpeaker: expectedSpeaker || null,
+  metricsMs: {
+    login: Math.round(loginCompletedAt - testStartedAt),
+    ready: milliseconds(result.readyAt),
+    firstFinal: milliseconds(result.firstFinalAt),
+    finalized: milliseconds(result.finalizedAt)
+  },
+  preparationUpdates: result.preparationUpdates,
+  finalSegments: result.finalSegments
+}, null, 2));

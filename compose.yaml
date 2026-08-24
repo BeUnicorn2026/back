@@ -10,9 +10,13 @@ services:
       NODE_ENV: production
       PORT: 3001
       VOICE_PARTITION_DATA_DIR: /app/.data
+      SPEAKER_MODEL_CACHE: /app/.cache/speaker-models
+      PRELOAD_SPEAKER_MODEL: "true"
     volumes:
       - voice-partition-data:/app/.data
+      - voice-partition-speaker-models:/app/.cache/speaker-models
     stop_grace_period: 15s
 
 volumes:
   voice-partition-data:
+  voice-partition-speaker-models:
