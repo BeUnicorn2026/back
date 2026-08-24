@@ -10,7 +10,7 @@ import { AuthError, AuthStore } from "./lib/auth-store.mjs";
 import { analyzePcmQuality, isSpeakerInferenceQuality } from "./lib/audio-quality.mjs";
 import { normalizeTranscript } from "./lib/normalize-transcript.mjs";
 import { assessSpeakerProfileExtension, getSpeakerEmbeddingModel, mergeSpeakerProfileVectors, speakerModelInfo } from "./lib/speaker-embedding-model.mjs";
-import { diarizedAudioRegions, SpeakerIdentityTracker, wordsToSegments, wordsToTranscriptSegments } from "./lib/speaker-matching.mjs";
+import { diarizedAudioRegions, speakerDecision, SpeakerIdentityTracker, wordsToSegments, wordsToTranscriptSegments } from "./lib/speaker-matching.mjs";
 import { SpeakerStore } from "./lib/speaker-store.mjs";
 import { MeetingStore } from "./lib/meeting-store.mjs";
 import { reconcileTranscriptSpeakers } from "./lib/reconcile-speakers.mjs";
@@ -196,6 +196,8 @@ const verificationResendRateLimit = rateLimit("email-verification-resend", { lim
 const meetingAnalysisRateLimit = rateLimit("meeting-analysis", { limit: 12, windowMs: 60 * 60_000 }, (request) =>
   `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
 const speakerEnrollmentRateLimit = rateLimit("speaker-enrollment", { limit: 12, windowMs: 60 * 60_000 }, (request) =>
+  `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
+const speakerIdentificationRateLimit = rateLimit("speaker-identification", { limit: 30, windowMs: 60 * 60_000 }, (request) =>
   `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
 const knowledgeEvidenceRateLimit = rateLimit("knowledge-evidence", { limit: 240, windowMs: 60 * 60_000 }, (request) =>
   request.auth?.user?.id || request.ip);
@@ -828,6 +830,53 @@ app.post("/api/speakers", requireTrustedOrigin, requireAuth, requireOrganization
     return response.status(422).json({ error: error.message || "목소리를 등록하지 못했습니다." });
   }
 });
+
+app.post("/api/speakers/identify", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
+  speakerIdentificationRateLimit, upload.single("voice"), async (request, response) => {
+    if (!request.file) return response.status(400).json({ error: "식별할 MP3 또는 WAV 음성이 필요합니다." });
+    try {
+      const speakers = await speakerStore.loadProfiles(request.auth.organization.id);
+      if (!speakers.length) return response.status(409).json({ error: "먼저 한 명 이상의 목소리를 등록해 주세요." });
+      const pcm = await decodeToPcm(request.file.buffer, 15);
+      const samples = new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2));
+      const quality = analyzePcmQuality(samples, speakerModelInfo.sampleRate);
+      if (!isSpeakerInferenceQuality(quality)) {
+        return response.status(422).json({
+          error: quality.warnings[0] || "식별할 수 있는 말소리가 충분하지 않습니다.",
+          quality
+        });
+      }
+      const model = await prepareSpeakerModel();
+      const scores = await model.compare(samples, speakers.map(({ profiles }) => profiles));
+      if (!scores) return response.status(422).json({ error: "식별할 수 있는 말소리가 충분하지 않습니다.", quality });
+      const decision = speakerDecision(scores, speakers, {
+        threshold: Number(process.env.SPEAKER_MATCH_THRESHOLD) || 0.72,
+        margin: Number(process.env.SPEAKER_MATCH_MARGIN) || 0.04
+      });
+      const reasonMessages = {
+        accepted: `${decision.identity?.name || "등록 화자"}님의 목소리로 판정했습니다.`,
+        below_threshold: "등록된 어떤 목소리와도 충분히 가깝지 않아 미등록 화자로 판정했습니다.",
+        ambiguous: "둘 이상의 등록 목소리와 비슷해 안전하게 이름을 확정하지 않았습니다.",
+        invalid_scores: "화자 비교 결과를 계산하지 못했습니다."
+      };
+      return response.json({
+        identification: {
+          matched: decision.accepted,
+          speaker: decision.identity ? { id: decision.identity.id, name: decision.identity.name } : null,
+          confidence: decision.bestScore,
+          scoreGap: decision.scoreGap,
+          requiredThreshold: decision.requiredThreshold,
+          requiredMargin: decision.requiredMargin,
+          reason: decision.reason,
+          message: reasonMessages[decision.reason]
+        },
+        quality
+      });
+    } catch (error) {
+      console.error("Speaker identification probe failed:", error);
+      return response.status(422).json({ error: error.message || "테스트 음성을 식별하지 못했습니다." });
+    }
+  });
 
 app.post("/api/speakers/:id/samples", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, speakerEnrollmentRateLimit, upload.single("voice"), async (request, response) => {
   if (!/^[a-f0-9-]{36}$/i.test(request.params.id)) return response.status(400).json({ error: "잘못된 화자 ID입니다." });

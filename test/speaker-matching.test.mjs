@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  chooseKnownSpeaker, diarizedAudioRegions, SpeakerIdentityTracker, wordsToSegments, wordsToTranscriptSegments
+  chooseKnownSpeaker, diarizedAudioRegions, speakerDecision, SpeakerIdentityTracker, wordsToSegments, wordsToTranscriptSegments
 } from "../lib/speaker-matching.mjs";
 import { assessSpeakerProfileExtension, cosineSimilarity, mergeSpeakerProfileVectors, pcmRms } from "../lib/speaker-embedding-model.mjs";
 
@@ -14,6 +14,19 @@ test("accepts a registered speaker above threshold and margin", () => {
 test("rejects ambiguous and low-scoring voices", () => {
   assert.equal(chooseKnownSpeaker([0.68, 0.2], speakers), null);
   assert.equal(chooseKnownSpeaker([0.92, 0.89], speakers), null);
+});
+
+test("explains whether a probe failed its threshold or separation margin", () => {
+  const calibrated = [{ id: "one", name: "민수", matchThreshold: 0.74 }, { id: "two", name: "지수" }];
+  const quiet = speakerDecision([0.7, 0.2], calibrated, { margin: 0.04 });
+  assert.equal(quiet.reason, "below_threshold");
+  assert.equal(quiet.requiredThreshold, 0.74);
+  const ambiguous = speakerDecision([0.78, 0.76], calibrated, { margin: 0.04 });
+  assert.equal(ambiguous.reason, "ambiguous");
+  assert.ok(ambiguous.scoreGap < ambiguous.requiredMargin);
+  const accepted = speakerDecision([0.82, 0.7], calibrated, { margin: 0.04 });
+  assert.equal(accepted.identity.name, "민수");
+  assert.equal(accepted.reason, "accepted");
 });
 
 test("uses enrollment-specific thresholds and stabilizes a diarized speaker cluster", () => {
