@@ -9,7 +9,7 @@ import WebSocket, { WebSocketServer } from "ws";
 import { AuthError, AuthStore } from "./lib/auth-store.mjs";
 import { analyzePcmQuality, isSpeakerInferenceQuality } from "./lib/audio-quality.mjs";
 import { normalizeTranscript } from "./lib/normalize-transcript.mjs";
-import { assessSpeakerProfileExtension, getSpeakerEmbeddingModel, mergeSpeakerProfileVectors, speakerModelInfo } from "./lib/speaker-embedding-model.mjs";
+import { assessSpeakerProfileExtension, getSpeakerEmbeddingModel, mergeSpeakerProfileVectors, speakerInferenceInfo, speakerModelInfo } from "./lib/speaker-embedding-model.mjs";
 import { diarizedAudioRegions, speakerDecision, SpeakerIdentityTracker, wordsToSegments, wordsToTranscriptSegments } from "./lib/speaker-matching.mjs";
 import { SpeakerStore } from "./lib/speaker-store.mjs";
 import { MeetingStore } from "./lib/meeting-store.mjs";
@@ -297,6 +297,7 @@ function configuredServices() {
     database: databaseMode,
     speakerStorage: speakerStorageMode,
     speakerModel: speakerModelInfo.id,
+    speakerInference: speakerInferenceInfo,
     speakerModelState,
     knowledgeTwin: "evidence-v1"
   };
@@ -847,7 +848,7 @@ app.post("/api/speakers/identify", requireTrustedOrigin, requireAuth, requireOrg
         });
       }
       const model = await prepareSpeakerModel();
-      const scores = await model.compare(samples, speakers.map(({ profiles }) => profiles));
+      const scores = await model.compare(samples, speakers.map(({ profiles }) => profiles), { maximumEmbeddings: 3 });
       if (!scores) return response.status(422).json({ error: "식별할 수 있는 말소리가 충분하지 않습니다.", quality });
       const decision = speakerDecision(scores, speakers, {
         threshold: Number(process.env.SPEAKER_MATCH_THRESHOLD) || 0.72,

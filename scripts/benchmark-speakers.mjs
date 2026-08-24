@@ -3,7 +3,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { analyzePcmQuality } from "../lib/audio-quality.mjs";
-import { getSpeakerEmbeddingModel, mergeSpeakerProfileVectors } from "../lib/speaker-embedding-model.mjs";
+import { getSpeakerEmbeddingModel, mergeSpeakerProfileVectors, speakerInferenceInfo } from "../lib/speaker-embedding-model.mjs";
 import { assessBenchmarkCoverage, calibrateSpeakerThreshold, evaluateSpeakerTrials } from "../lib/speaker-evaluation.mjs";
 
 const argumentsList = process.argv.slice(2);
@@ -101,7 +101,7 @@ for (const probe of manifest.probes) {
   }
   const pcm = await decodeToPcm(file);
   const quality = analyzePcmQuality(pcm);
-  const scores = await model.compare(pcm, speakers.map(({ profiles }) => profiles));
+  const scores = await model.compare(pcm, speakers.map(({ profiles }) => profiles), { maximumEmbeddings: 3 });
   if (!scores) throw new Error(`${probe.file}: 말소리가 부족해 비교하지 못했습니다.`);
   trials.push({ file: probe.file, expectedSpeakerId: probe.speakerId ?? null, scores });
   probeQuality.push({ file: probe.file, quality });
@@ -123,6 +123,7 @@ const calibration = coverage.ready
 const report = {
   generatedAt: new Date().toISOString(),
   model: "Xenova/wavlm-base-plus-sv",
+  inference: speakerInferenceInfo,
   dataset: { speakers: speakers.length, probes: trials.length },
   coverage,
   enrollmentQuality,

@@ -17,7 +17,7 @@ const pcm = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.byteLength /
 const model = await SpeakerEmbeddingModel.create(".cache/speaker-models", modelPath);
 const profile = await model.createProfile(pcm);
 const norm = Math.sqrt(profile.centroid.reduce((sum, value) => sum + value * value, 0));
-const [selfScore] = await model.compare(pcm, [[profile.centroid, ...profile.exemplars]]);
+const [selfScore] = await model.compare(pcm, [[profile.centroid, ...profile.exemplars]], { maximumEmbeddings: 3 });
 console.log(JSON.stringify({
   dimensions: profile.centroid.length,
   norm,

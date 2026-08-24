@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   chooseKnownSpeaker, diarizedAudioRegions, speakerDecision, SpeakerIdentityTracker, wordsToSegments, wordsToTranscriptSegments
 } from "../lib/speaker-matching.mjs";
-import { assessSpeakerProfileExtension, cosineSimilarity, mergeSpeakerProfileVectors, pcmRms } from "../lib/speaker-embedding-model.mjs";
+import { assessSpeakerProfileExtension, cosineSimilarity, mergeSpeakerProfileVectors, pcmRms, speakerInferenceWindows } from "../lib/speaker-embedding-model.mjs";
 
 const speakers = [{ id: "one", name: "민수" }, { id: "two", name: "지수" }];
 
@@ -113,6 +113,19 @@ test("computes normalized speaker similarity and detects silence", () => {
   assert.equal(cosineSimilarity(new Float32Array([1, 0]), new Float32Array([0, 1])), 0);
   assert.equal(pcmRms(new Int16Array(160)), 0);
   assert.ok(pcmRms(new Int16Array([16384, -16384])) > 0.49);
+});
+
+test("selects dense full-length speech windows without increasing real-time inference count", () => {
+  const pcm = new Int16Array(8 * 16_000);
+  for (let index = 4 * 16_000; index < 7 * 16_000; index += 1) {
+    pcm[index] = Math.round(Math.sin(index / 13) * 4_000);
+  }
+  const [best] = speakerInferenceWindows(pcm);
+  assert.equal(best.length, 3 * 16_000);
+  assert.ok(pcmRms(best) > pcmRms(pcm));
+  const diverse = speakerInferenceWindows(pcm, { maximumEmbeddings: 3 });
+  assert.equal(diverse.length, 3);
+  assert.ok(diverse.every((window) => window.length === 3 * 16_000));
 });
 
 test("merges and deduplicates speaker profiles across enrollment sessions", () => {
