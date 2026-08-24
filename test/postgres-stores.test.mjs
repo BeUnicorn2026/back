@@ -5,6 +5,7 @@ import { AuthError } from "../lib/auth-store.mjs";
 import { PostgresAuthStore } from "../lib/postgres-auth-store.mjs";
 import { PostgresDatabase } from "../lib/postgres-database.mjs";
 import { PostgresMeetingStore } from "../lib/postgres-meeting-store.mjs";
+import { PostgresKnowledgeStore } from "../lib/postgres-knowledge-store.mjs";
 import { PostgresRequestRateLimiter } from "../lib/postgres-rate-limiter.mjs";
 import { transcriptHash } from "../lib/meeting-intelligence.mjs";
 
@@ -101,5 +102,24 @@ test("PostgreSQL rate limiter shares an atomic fixed window", async () => {
     assert.equal(attempts.filter(({ allowed }) => allowed).length, 5);
     assert.equal(Math.min(...attempts.map(({ remaining }) => remaining)), 0);
     assert.equal((await limiter.consume("login:address:user", { limit: 5, windowMs: 1_000, now: 11_001 })).allowed, true);
+  });
+});
+
+test("PostgreSQL knowledge store keeps evidence idempotent and user-private", async () => {
+  await withDatabase(async (database) => {
+    const store = new PostgresKnowledgeStore(database);
+    const first = await store.recordEvidence({
+      userId: "user-a", conceptLabel: "임베딩", kind: "request_simpler",
+      eventId: "knowledge-event-1", organizationId: "org-a", meetingId: "meeting-a", segmentIndex: 2
+    });
+    assert.equal(first.duplicate, false);
+    assert.equal(first.state.status, "unknown");
+    const duplicate = await store.recordEvidence({
+      userId: "user-a", conceptLabel: "임베딩", kind: "request_simpler", eventId: "knowledge-event-1"
+    });
+    assert.equal(duplicate.duplicate, true);
+    assert.equal(duplicate.state.evidenceCount, 1);
+    assert.equal((await store.list("user-b")).length, 0);
+    assert.equal((await store.statesForTerms("user-a", ["임베딩"], [])).at(0).source, "evidence");
   });
 });
