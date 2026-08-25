@@ -30,6 +30,7 @@ import { PostgresKnowledgeStore } from "./lib/postgres-knowledge-store.mjs";
 import { knowledgeTwinDefaults, normalizeConceptLabel } from "./lib/knowledge-twin.mjs";
 import { personalizeKnowledgeTerms } from "./lib/knowledge-personalization.mjs";
 import { KnowledgeExplanationService, knowledgeExplanationCacheKey } from "./lib/knowledge-explanation.mjs";
+import { normalizeUploadFilename, uploadTitle } from "./lib/upload-filename.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 3001;
@@ -203,6 +204,8 @@ const knowledgeEvidenceRateLimit = rateLimit("knowledge-evidence", { limit: 240,
   request.auth?.user?.id || request.ip);
 const knowledgeExplanationRateLimit = rateLimit("knowledge-explanation", { limit: 30, windowMs: 60 * 60_000 }, (request) =>
   request.auth?.user?.id || request.ip);
+const transcriptionRateLimit = rateLimit("transcription", { limit: 12, windowMs: 60 * 60_000 }, (request) =>
+  `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
 
 app.use((request, response, next) => {
   const startedAt = performance.now();
@@ -379,6 +382,59 @@ function decodeToPcm(input, maximumSeconds = 30) {
     });
     ffmpeg.stdin.end(input);
   });
+}
+
+async function transcribeAudioFile(file, language, organizationId) {
+  const form = new FormData();
+  form.append("file", new Blob([file.buffer], { type: file.mimetype }), normalizeUploadFilename(file.originalname, "recording.webm"));
+  form.append("model", "gpt-4o-transcribe-diarize");
+  form.append("response_format", "diarized_json");
+  form.append("chunking_strategy", "auto");
+  if (language) form.append("language", language);
+
+  const allKnownSpeakers = await speakerStore.loadProfiles(organizationId);
+  const knownSpeakers = allKnownSpeakers.slice(0, 4);
+  if (knownSpeakers.length) {
+    form.append("known_speaker_names", JSON.stringify(knownSpeakers.map(({ name }) => name)));
+    form.append("known_speaker_references", JSON.stringify(knownSpeakers.map(({ referenceAudio }) =>
+      `data:audio/wav;base64,${referenceAudio.toString("base64")}`)));
+  }
+
+  const openAIResponse = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+    body: form,
+    signal: AbortSignal.timeout(120_000)
+  });
+  const payload = await openAIResponse.json().catch(() => null);
+  if (!openAIResponse.ok) {
+    const error = new Error(payload?.error?.message || "음성을 전사하지 못했습니다.");
+    error.status = openAIResponse.status;
+    throw error;
+  }
+  const normalized = normalizeTranscript(payload, { knownSpeakers: knownSpeakers.map(({ name }) => name) });
+  if (!allKnownSpeakers.length) return normalized;
+  try {
+    const decoded = await decodeToPcm(file.buffer, 1_800);
+    const pcm = new Int16Array(decoded.buffer, decoded.byteOffset, Math.floor(decoded.byteLength / 2));
+    const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath);
+    return await reconcileTranscriptSpeakers(normalized, pcm, allKnownSpeakers, model, {
+      threshold: Number(process.env.SPEAKER_MATCH_THRESHOLD) || 0.72,
+      margin: Number(process.env.SPEAKER_MATCH_MARGIN) || 0.04
+    });
+  } catch (speakerError) {
+    console.error("Final speaker reconciliation failed:", speakerError);
+    return normalized;
+  }
+}
+
+function transcriptionErrorResponse(error, response) {
+  if (error?.name === "TimeoutError") return response.status(504).json({ error: "전사 시간이 초과되었습니다." });
+  if (Number.isInteger(error?.status) && error.status >= 400 && error.status < 600) {
+    return response.status(error.status).json({ error: error.message });
+  }
+  console.error("Transcription failed:", error);
+  return response.status(500).json({ error: "전사 중 서버 오류가 발생했습니다." });
 }
 
 async function enrollProfile(pcm) {
@@ -743,6 +799,30 @@ app.post("/api/meetings", requireTrustedOrigin, requireAuth, requireOrganization
   response.status(201).json({ meeting });
 });
 
+app.post("/api/meetings/import", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
+  transcriptionRateLimit, upload.single("audio"), async (request, response) => {
+    if (!process.env.OPENAI_API_KEY) return response.status(503).json({ error: "OPENAI_API_KEY가 설정되지 않았습니다." });
+    if (!request.file) return response.status(400).json({ error: "지원되는 오디오 파일이 필요합니다." });
+    try {
+      const language = typeof request.body?.language === "string" ? request.body.language.trim() : "";
+      const transcription = await transcribeAudioFile(request.file, language, request.auth.organization.id);
+      if (!transcription.segments?.length) return response.status(422).json({ error: "인식된 대화가 없습니다." });
+      const meeting = await meetingStore.createCompleted({
+        organizationId: request.auth.organization.id,
+        createdBy: request.auth.user.id,
+        language,
+        source: "upload",
+        mode: "speaker",
+        title: uploadTitle(request.file.originalname),
+        segments: transcription.segments,
+        duration: transcription.duration
+      });
+      return response.status(201).json({ meeting });
+    } catch (error) {
+      return transcriptionErrorResponse(error, response);
+    }
+  });
+
 app.patch("/api/meetings/:id", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
   const meeting = await meetingStore.update(request.params.id, request.auth.organization.id, request.body || {});
   if (!meeting) return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
@@ -935,60 +1015,16 @@ app.delete("/api/speakers/:id", requireTrustedOrigin, requireAuth, requireOrgani
   response.status(204).end();
 });
 
-app.post("/api/transcribe", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, upload.single("audio"), async (request, response) => {
+app.post("/api/transcribe", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
+  transcriptionRateLimit, upload.single("audio"), async (request, response) => {
   if (!process.env.OPENAI_API_KEY) return response.status(503).json({ error: "OPENAI_API_KEY가 설정되지 않았습니다." });
   if (!request.file) return response.status(400).json({ error: "지원되는 오디오 파일이 필요합니다." });
 
   try {
-    const form = new FormData();
-    form.append("file", new Blob([request.file.buffer], { type: request.file.mimetype }), request.file.originalname || "recording.webm");
-    form.append("model", "gpt-4o-transcribe-diarize");
-    form.append("response_format", "diarized_json");
-    form.append("chunking_strategy", "auto");
-
     const language = typeof request.body?.language === "string" ? request.body.language.trim() : "";
-    if (language) form.append("language", language);
-
-    const allKnownSpeakers = await speakerStore.loadProfiles(request.auth.organization.id);
-    const knownSpeakers = allKnownSpeakers.slice(0, 4);
-    const knownSpeakerReferences = [];
-    for (const speaker of knownSpeakers) {
-      knownSpeakerReferences.push(`data:audio/wav;base64,${speaker.referenceAudio.toString("base64")}`);
-    }
-    if (knownSpeakers.length) {
-      form.append("known_speaker_names", JSON.stringify(knownSpeakers.map(({ name }) => name)));
-      form.append("known_speaker_references", JSON.stringify(knownSpeakerReferences));
-    }
-
-    const openAIResponse = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-      body: form,
-      signal: AbortSignal.timeout(120_000)
-    });
-    const payload = await openAIResponse.json().catch(() => null);
-    if (!openAIResponse.ok) {
-      return response.status(openAIResponse.status).json({ error: payload?.error?.message || "음성을 전사하지 못했습니다." });
-    }
-    const normalized = normalizeTranscript(payload, { knownSpeakers: knownSpeakers.map(({ name }) => name) });
-    if (!allKnownSpeakers.length) return response.json(normalized);
-    try {
-      const decoded = await decodeToPcm(request.file.buffer, 1_800);
-      const pcm = new Int16Array(decoded.buffer, decoded.byteOffset, Math.floor(decoded.byteLength / 2));
-      const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath);
-      const reconciled = await reconcileTranscriptSpeakers(normalized, pcm, allKnownSpeakers, model, {
-        threshold: Number(process.env.SPEAKER_MATCH_THRESHOLD) || 0.72,
-        margin: Number(process.env.SPEAKER_MATCH_MARGIN) || 0.04
-      });
-      return response.json(reconciled);
-    } catch (speakerError) {
-      console.error("Final speaker reconciliation failed:", speakerError);
-      return response.json(normalized);
-    }
+    return response.json(await transcribeAudioFile(request.file, language, request.auth.organization.id));
   } catch (error) {
-    if (error?.name === "TimeoutError") return response.status(504).json({ error: "전사 시간이 초과되었습니다." });
-    console.error("Transcription failed:", error);
-    return response.status(500).json({ error: "전사 중 서버 오류가 발생했습니다." });
+    return transcriptionErrorResponse(error, response);
   }
 });
 

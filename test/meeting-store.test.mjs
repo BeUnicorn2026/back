@@ -53,3 +53,21 @@ test("sanitizes meeting updates and preserves explicit titles", async () => {
   assert.equal(updated.segments[0].start, 0);
   assert.equal(updated.segments[0].speaker, "미등록 화자");
 });
+
+test("creates a completed upload and its segments atomically", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-partition-meetings-"));
+  const store = new MeetingStore(root);
+  await assert.rejects(store.createCompleted({ organizationId: "org", createdBy: "user", segments: [] }),
+    /대화 내용/);
+  assert.equal((await store.list("org")).length, 0);
+
+  const meeting = await store.createCompleted({
+    organizationId: "org", createdBy: "user", language: "ko", title: "인터뷰.wav",
+    segments: [{ speaker: "민수", known: true, start: 1, end: 4.2, text: "파일 전사 결과입니다." }]
+  });
+  assert.equal(meeting.status, "completed");
+  assert.equal(meeting.source, "upload");
+  assert.equal(meeting.duration, 4.2);
+  assert.equal(meeting.segmentCount, 1);
+  assert.equal((await store.get(meeting.id, "org")).segments[0].text, "파일 전사 결과입니다.");
+});

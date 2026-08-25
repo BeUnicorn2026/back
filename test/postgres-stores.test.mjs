@@ -94,6 +94,22 @@ test("PostgreSQL meeting store persists segments and isolates organizations", as
   });
 });
 
+test("PostgreSQL meeting store creates completed uploads atomically", async () => {
+  await withDatabase(async (database) => {
+    const store = new PostgresMeetingStore(database);
+    await assert.rejects(store.createCompleted({ organizationId: "org", createdBy: "user", segments: [] }),
+      /대화 내용/);
+    assert.equal((await store.list("org")).length, 0);
+    const meeting = await store.createCompleted({
+      organizationId: "org", createdBy: "user", title: "인터뷰.wav",
+      segments: [{ speaker: "민수", start: 0, end: 5.5, text: "원자적으로 저장합니다." }]
+    });
+    assert.equal(meeting.status, "completed");
+    assert.equal(meeting.duration, 5.5);
+    assert.equal(meeting.segmentCount, 1);
+  });
+});
+
 test("PostgreSQL rate limiter shares an atomic fixed window", async () => {
   await withDatabase(async (database) => {
     const limiter = new PostgresRequestRateLimiter(database);
