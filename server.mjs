@@ -875,6 +875,13 @@ app.patch("/api/meetings/:id", requireTrustedOrigin, requireAuth, requireOrganiz
   response.json({ meeting });
 });
 
+app.delete("/api/meetings/:id", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
+  if (!/^[a-f0-9-]{36}$/i.test(request.params.id)) return response.status(400).json({ error: "잘못된 회의 ID입니다." });
+  const removed = await meetingStore.remove(request.params.id, request.auth.organization.id);
+  if (!removed) return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
+  response.status(204).end();
+});
+
 app.get("/api/meetings/:id/intelligence", requireAuth, requireOrganization, async (request, response) => {
   const meeting = await meetingStore.get(request.params.id, request.auth.organization.id);
   if (!meeting) return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });

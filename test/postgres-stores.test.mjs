@@ -93,6 +93,10 @@ test("PostgreSQL meeting store persists segments and isolates organizations", as
     });
     assert.equal((await store.getIntelligence(meeting.id, "org-a", hash)).model, "test-model");
     assert.equal(await store.getIntelligence(meeting.id, "org-b", hash), null);
+    assert.equal(await store.remove(meeting.id, "org-b"), false);
+    assert.equal(await store.remove(meeting.id, "org-a"), true);
+    assert.equal(await store.get(meeting.id, "org-a"), null);
+    assert.equal(await store.getIntelligence(meeting.id, "org-a", hash), null);
   });
 });
 
