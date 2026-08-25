@@ -14,6 +14,6 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/Unicorn/back %h/Unicorn/releases %h/Unicorn/current
+ReadWritePaths=%h/Unicorn
 RestrictSUIDSGID=true
 LockPersonality=true

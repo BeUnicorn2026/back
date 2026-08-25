@@ -6,7 +6,8 @@ source_repository="$base/back"
 releases="$base/releases"
 branch="${DEPLOY_BRANCH:-main}"
 
-exec 9>"$base/update.lock"
+mkdir -p "$releases"
+exec 9>"$releases/.update.lock"
 flock -n 9 || exit 0
 
 git -C "$source_repository" fetch --quiet origin "$branch"
