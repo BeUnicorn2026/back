@@ -31,5 +31,7 @@ test("preserves registered speaker names from known-speaker transcription", () =
   }, { knownSpeakers: ["민수"] });
 
   assert.equal(result.segments[0].speaker, "민수");
+  assert.equal(result.segments[0].known, true);
+  assert.equal(result.segments[0].confidence, null);
   assert.deepEqual(result.speakers, ["민수"]);
 });
