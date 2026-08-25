@@ -422,15 +422,20 @@ async function transcribeAudioFile(file, language, organizationId) {
     if (knownSpeakerReferences.length >= 4) break;
     if (!Buffer.isBuffer(speaker.referenceAudio) || !speaker.referenceAudio.length) continue;
     try {
-      const decodedReference = await decodeToPcm(speaker.referenceAudio, 10);
-      const referenceSamples = new Int16Array(
+      const decodedReference = await decodeToPcm(speaker.referenceAudio);
+      const decodedSamples = new Int16Array(
         decodedReference.buffer,
         decodedReference.byteOffset,
         Math.floor(decodedReference.byteLength / 2)
       );
+      const referenceSamples = selectSpeakerReferencePcm(decodedSamples);
       const duration = referenceSamples.length / speakerModelInfo.sampleRate;
-      if (duration < 2 || duration > 10) continue;
-      knownSpeakerReferences.push({ name: speaker.name, audio: pcmToWave(decodedReference) });
+      const referenceQuality = analyzePcmQuality(referenceSamples, speakerModelInfo.sampleRate);
+      if (duration < 2 || duration > 10 || !isSpeakerInferenceQuality(referenceQuality)) continue;
+      knownSpeakerReferences.push({
+        name: speaker.name,
+        audio: pcmToWave(Buffer.from(referenceSamples.buffer, referenceSamples.byteOffset, referenceSamples.byteLength))
+      });
     } catch (error) {
       console.error(`Known speaker reference skipped (${speaker.id}):`, error.message);
     }
