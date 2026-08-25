@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   chooseKnownSpeaker, diarizedAudioRegions, speakerDecision, SpeakerIdentityTracker, wordsToSegments, wordsToTranscriptSegments
 } from "../lib/speaker-matching.mjs";
-import { assessSpeakerProfileExtension, cosineSimilarity, mergeSpeakerProfileVectors, pcmRms, speakerInferenceWindows } from "../lib/speaker-embedding-model.mjs";
+import { assessNewSpeakerSeparation, assessSpeakerProfileExtension, cosineSimilarity, mergeSpeakerProfileVectors, pcmRms, speakerInferenceWindows } from "../lib/speaker-embedding-model.mjs";
 
 const speakers = [{ id: "one", name: "민수" }, { id: "two", name: "지수" }];
 
@@ -146,6 +146,15 @@ test("accepts matching enrollment extensions and rejects another registered spea
   const rejected = assessSpeakerProfileExtension(target, [new Float32Array([0.05, 0.99])], [other]);
   assert.equal(rejected.accepted, false);
   assert.match(rejected.reason, /지수|일치하지 않습니다/);
+});
+
+test("rejects registering a new name for an existing voice", () => {
+  const existing = [{ id: "one", name: "민수", profiles: [new Float32Array([1, 0])] }];
+  const collision = assessNewSpeakerSeparation([new Float32Array([0.99, 0.01])], existing);
+  assert.equal(collision.accepted, false);
+  assert.equal(collision.nearest.name, "민수");
+  assert.match(collision.reason, /기존 화자에 샘플/);
+  assert.equal(assessNewSpeakerSeparation([new Float32Array([0, 1])], existing).accepted, true);
 });
 
 test("creates a speaker-free segment for isolated STT testing", () => {

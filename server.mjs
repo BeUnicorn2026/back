@@ -9,7 +9,7 @@ import WebSocket, { WebSocketServer } from "ws";
 import { AuthError, AuthStore } from "./lib/auth-store.mjs";
 import { analyzePcmQuality, isSpeakerInferenceQuality } from "./lib/audio-quality.mjs";
 import { normalizeTranscript } from "./lib/normalize-transcript.mjs";
-import { assessSpeakerProfileExtension, getSpeakerEmbeddingModel, mergeSpeakerProfileVectors, speakerInferenceInfo, speakerModelInfo } from "./lib/speaker-embedding-model.mjs";
+import { assessNewSpeakerSeparation, assessSpeakerProfileExtension, getSpeakerEmbeddingModel, mergeSpeakerProfileVectors, speakerInferenceInfo, speakerModelInfo } from "./lib/speaker-embedding-model.mjs";
 import { diarizedAudioRegions, speakerDecision, SpeakerIdentityTracker, wordsToSegments, wordsToTranscriptSegments } from "./lib/speaker-matching.mjs";
 import { SpeakerStore } from "./lib/speaker-store.mjs";
 import { MeetingStore } from "./lib/meeting-store.mjs";
@@ -914,7 +914,7 @@ app.post("/api/speakers", requireTrustedOrigin, requireAuth, requireOrganization
   if (!request.file) return response.status(400).json({ error: "MP3 또는 WAV 등록 음성이 필요합니다." });
 
   try {
-    const existing = await speakerStore.list(request.auth.organization.id);
+    const existing = await speakerStore.loadProfiles(request.auth.organization.id);
     if (existing.some((speaker) => speaker.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
       return response.status(409).json({ error: "이미 등록된 이름입니다." });
     }
@@ -931,6 +931,10 @@ app.post("/api/speakers", requireTrustedOrigin, requireAuth, requireOrganization
       });
     }
     const profile = await enrollProfile(pcm);
+    const separation = assessNewSpeakerSeparation(profile.vectors, existing);
+    if (!separation.accepted) {
+      return response.status(422).json({ error: separation.reason, comparison: separation });
+    }
     const enrolledAt = new Date().toISOString();
     const speaker = {
       id: randomUUID(), name, duration, model: speakerModelInfo.id,
