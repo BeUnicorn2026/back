@@ -182,6 +182,27 @@ async function prepareSpeakerModel() {
     throw error;
   }
 }
+
+function transcriptProfileForCurrentUser(auth) {
+  return {
+    id: null,
+    speakerProfileId: null,
+    createdBy: auth.user.id,
+    userId: auth.user.id,
+    name: auth.user.name,
+    displayName: auth.user.name,
+    profiles: []
+  };
+}
+
+async function roomTranscriptProfile(auth) {
+  // 화자 recognition을 다시 켤 때만 회의 입장 전에 등록 프로필을 요구한다.
+  // return (await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth })).profile;
+  if (speakerRecognitionEnabled) {
+    return (await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth })).profile;
+  }
+  return transcriptProfileForCurrentUser(auth);
+}
 const maxAudioBytes = 25 * 1024 * 1024;
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -1142,7 +1163,7 @@ app.get("/api/speakers", requireAuth, requireOrganization, async (request, respo
 });
 
 app.post("/api/rooms", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
-  await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
+  // await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
   const room = await roomStore.create({
     organizationId: request.auth.organization.id,
     createdBy: request.auth.user.id,
@@ -1153,7 +1174,7 @@ app.post("/api/rooms", requireTrustedOrigin, requireAuth, requireOrganization, r
 });
 
 app.post("/api/rooms/join", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
-  await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
+  // await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
   const room = await roomStore.join({
     organizationId: request.auth.organization.id,
     userId: request.auth.user.id,
@@ -1181,7 +1202,7 @@ app.post("/api/rooms/:id/close", requireTrustedOrigin, requireAuth, requireOrgan
 
 app.post("/api/rooms/:id/meetings", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
   const room = await requireRoomMember({ roomStore, roomId: request.params.id, auth: request.auth });
-  await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
+  // await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
   const meeting = await bindRoomMeeting({
     meetingStore,
     room,
@@ -1779,7 +1800,7 @@ liveServer.on("connection", async (client, request, requestUrl) => {
       const auth = await authStore.getContextBySession(sessionToken(request));
       if (!auth) throw new VoiceProfileError("UNAUTHENTICATED", "로그인이 필요합니다.", 401);
       const room = await requireRoomMember({ roomStore, roomId: requestedRoomId, auth });
-      const canonical = await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth });
+      const canonicalProfile = await roomTranscriptProfile(auth);
       const billingAccess = await requireMeetingAllowance(auth.organization.id);
       const meeting = await bindRoomMeeting({
         meetingStore,
@@ -1833,7 +1854,7 @@ liveServer.on("connection", async (client, request, requestUrl) => {
         auth,
         room,
         meeting,
-        canonicalProfile: canonical.profile,
+        canonicalProfile,
         meetingStore,
         prepareSpeakerModel,
         speakerRecognitionEnabled,
