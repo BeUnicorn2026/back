@@ -38,6 +38,7 @@ import { expectedSpeakerScore, recordingEnvelopeSimilarity, speakerProbeFingerpr
 import { sessionCookiePolicy } from "./lib/session-cookie-policy.mjs";
 import { speakerRegionSampleRange } from "./lib/live-speaker-regions.mjs";
 import { isSupportedAudioUpload } from "./lib/audio-upload.mjs";
+import { selectSpeakerReferencePcm } from "./lib/speaker-reference.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 3001;
@@ -416,11 +417,28 @@ async function transcribeAudioFile(file, language, organizationId) {
   if (language) form.append("language", language);
 
   const allKnownSpeakers = await speakerStore.loadProfiles(organizationId);
-  const knownSpeakers = allKnownSpeakers.slice(0, 4);
-  if (knownSpeakers.length) {
-    form.append("known_speaker_names", JSON.stringify(knownSpeakers.map(({ name }) => name)));
-    form.append("known_speaker_references", JSON.stringify(knownSpeakers.map(({ referenceAudio }) =>
-      `data:audio/wav;base64,${referenceAudio.toString("base64")}`)));
+  const knownSpeakerReferences = [];
+  for (const speaker of allKnownSpeakers) {
+    if (knownSpeakerReferences.length >= 4) break;
+    if (!Buffer.isBuffer(speaker.referenceAudio) || !speaker.referenceAudio.length) continue;
+    try {
+      const decodedReference = await decodeToPcm(speaker.referenceAudio, 10);
+      const referenceSamples = new Int16Array(
+        decodedReference.buffer,
+        decodedReference.byteOffset,
+        Math.floor(decodedReference.byteLength / 2)
+      );
+      const duration = referenceSamples.length / speakerModelInfo.sampleRate;
+      if (duration < 2 || duration > 10) continue;
+      knownSpeakerReferences.push({ name: speaker.name, audio: pcmToWave(decodedReference) });
+    } catch (error) {
+      console.error(`Known speaker reference skipped (${speaker.id}):`, error.message);
+    }
+  }
+  if (knownSpeakerReferences.length) {
+    form.append("known_speaker_names", JSON.stringify(knownSpeakerReferences.map(({ name }) => name)));
+    form.append("known_speaker_references", JSON.stringify(knownSpeakerReferences.map(({ audio }) =>
+      `data:audio/wav;base64,${audio.toString("base64")}`)));
   }
 
   const openAIResponse = await fetch("https://api.openai.com/v1/audio/transcriptions", {
@@ -435,7 +453,7 @@ async function transcribeAudioFile(file, language, organizationId) {
     error.status = openAIResponse.status;
     throw error;
   }
-  const normalized = normalizeTranscript(payload, { knownSpeakers: knownSpeakers.map(({ name }) => name) });
+  const normalized = normalizeTranscript(payload, { knownSpeakers: knownSpeakerReferences.map(({ name }) => name) });
   if (!allKnownSpeakers.length) return normalized;
   try {
     const decoded = await decodeToPcm(file.buffer, 1_800);
@@ -974,7 +992,13 @@ app.post("/api/speakers", requireTrustedOrigin, requireAuth, requireOrganization
       createdBy: request.auth.user.id,
       createdAt: new Date().toISOString()
     };
-    const storedSpeaker = await speakerStore.save(speaker, profile.buffer, pcmToWave(pcm));
+    const selectedReference = selectSpeakerReferencePcm(samples);
+    const referenceAudio = pcmToWave(Buffer.from(
+      selectedReference.buffer,
+      selectedReference.byteOffset,
+      selectedReference.byteLength
+    ));
+    const storedSpeaker = await speakerStore.save(speaker, profile.buffer, referenceAudio);
     return response.status(201).json({ speaker: publicSpeakerProfile(storedSpeaker) });
   } catch (error) {
     console.error("Speaker enrollment failed:", error);
@@ -1131,7 +1155,10 @@ app.post("/api/speakers/:id/samples", requireTrustedOrigin, requireAuth, require
     delete updated.profile;
     delete updated.profiles;
     delete updated.referenceAudio;
-    const referenceAudio = quality.score > (existing.audioQuality?.score || 0) ? pcmToWave(pcm) : existing.referenceAudio;
+    const selectedReference = selectSpeakerReferencePcm(samples);
+    const referenceAudio = quality.score > (existing.audioQuality?.score || 0)
+      ? pcmToWave(Buffer.from(selectedReference.buffer, selectedReference.byteOffset, selectedReference.byteLength))
+      : existing.referenceAudio;
     const storedSpeaker = await speakerStore.replace(updated, profileBuffer, referenceAudio, request.auth.organization.id);
     return response.json({ speaker: publicSpeakerProfile(storedSpeaker) });
   } catch (error) {
