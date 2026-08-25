@@ -44,6 +44,18 @@ test("atomically replaces a speaker profile only inside the organization", async
   assert.equal((await readdir(root)).some((entry) => entry.includes("partial-") || entry.includes("backup-")), false);
 });
 
+test("updates verification metadata without rewriting biometric payloads", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-partition-metadata-speakers-"));
+  const store = new SpeakerStore(root, { encryptionKey: randomBytes(32).toString("base64") });
+  await store.save(metadata(), Buffer.from(new Float32Array([1, 0]).buffer), Buffer.from("reference"));
+  assert.equal(await store.updateMetadata("speaker-a", "other-org", { crossSessionVerificationCount: 1 }), null);
+  const updated = await store.updateMetadata("speaker-a", "org", { crossSessionVerificationCount: 1 });
+  assert.equal(updated.crossSessionVerificationCount, 1);
+  const [loaded] = await store.loadProfiles("org");
+  assert.deepEqual(Array.from(loaded.profile), [1, 0]);
+  assert.deepEqual(loaded.referenceAudio, Buffer.from("reference"));
+});
+
 test("keeps development compatibility but rejects plaintext in production mode", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "voice-partition-plain-speakers-"));
   const plainStore = new SpeakerStore(root);

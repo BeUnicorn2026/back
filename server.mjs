@@ -33,6 +33,7 @@ import { KnowledgeExplanationService, knowledgeExplanationCacheKey } from "./lib
 import { normalizeUploadFilename, uploadTitle } from "./lib/upload-filename.mjs";
 import { serviceReadiness } from "./lib/service-readiness.mjs";
 import { createConcurrencyLimit } from "./lib/concurrency-limit.mjs";
+import { speakerProbeFingerprint, speakerVerificationUpdate } from "./lib/speaker-verification.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 3001;
@@ -310,6 +311,21 @@ function configuredServices() {
     speakerModelState,
     knowledgeTwin: "evidence-v1"
   };
+}
+
+function publicSpeakerProfile(speaker) {
+  if (!speaker) return null;
+  const {
+    profile: _profile,
+    profiles: _profiles,
+    referenceAudio: _referenceAudio,
+    enrollmentFingerprints: _enrollmentFingerprints,
+    verificationFingerprints: _verificationFingerprints,
+    storage: _storage,
+    encryption: _encryption,
+    ...publicProfile
+  } = speaker;
+  return publicProfile;
 }
 
 async function personalizedTermsFor(user, terms) {
@@ -795,7 +811,7 @@ app.get("/api/health/ready", async (_request, response) => {
 });
 
 app.get("/api/speakers", requireAuth, requireOrganization, async (request, response) => {
-  response.json({ speakers: await speakerStore.list(request.auth.organization.id) });
+  response.json({ speakers: (await speakerStore.list(request.auth.organization.id)).map(publicSpeakerProfile) });
 });
 
 app.get("/api/meetings", requireAuth, requireOrganization, async (request, response) => {
@@ -906,7 +922,8 @@ app.post("/api/speakers", requireTrustedOrigin, requireAuth, requireOrganization
     const pcm = await decodeToPcm(request.file.buffer);
     const duration = pcm.length / 2 / 16_000;
     if (duration < 5) return response.status(400).json({ error: "등록 음성은 한 사람의 말소리가 포함된 5초 이상이어야 합니다." });
-    const quality = analyzePcmQuality(new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2)));
+    const samples = new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2));
+    const quality = analyzePcmQuality(samples);
     if (!quality.usable) {
       return response.status(422).json({
         error: quality.warnings[0] || "등록 음성 품질이 충분하지 않습니다.",
@@ -926,12 +943,13 @@ app.post("/api/speakers", requireTrustedOrigin, requireAuth, requireOrganization
       totalEnrollmentDuration: duration,
       lastEnrolledAt: enrolledAt,
       enrollmentSessions: [{ duration, qualityScore: quality.score, enrolledAt }],
+      enrollmentFingerprints: [speakerProbeFingerprint(samples)],
       organizationId: request.auth.organization.id,
       createdBy: request.auth.user.id,
       createdAt: new Date().toISOString()
     };
     const storedSpeaker = await speakerStore.save(speaker, profile.buffer, pcmToWave(pcm));
-    return response.status(201).json({ speaker: storedSpeaker });
+    return response.status(201).json({ speaker: publicSpeakerProfile(storedSpeaker) });
   } catch (error) {
     console.error("Speaker enrollment failed:", error);
     return response.status(422).json({ error: error.message || "목소리를 등록하지 못했습니다." });
@@ -966,6 +984,32 @@ app.post("/api/speakers/identify", requireTrustedOrigin, requireAuth, requireOrg
         ambiguous: "둘 이상의 등록 목소리와 비슷해 안전하게 이름을 확정하지 않았습니다.",
         invalid_scores: "화자 비교 결과를 계산하지 못했습니다."
       };
+      let verification = { recorded: false, reason: decision.accepted ? "needs_new_enrollment" : "not_matched" };
+      let speakerProfile = null;
+      if (decision.accepted && decision.identity) {
+        const matchedSpeaker = speakers.find(({ id }) => id === decision.identity.id);
+        verification = speakerVerificationUpdate(matchedSpeaker, {
+          fingerprint: speakerProbeFingerprint(samples),
+          score: decision.bestScore,
+          qualityScore: quality.score,
+          independentRecording: request.body?.independentRecording === "true"
+        });
+        if (verification.recorded) {
+          speakerProfile = publicSpeakerProfile(await speakerStore.updateMetadata(
+            matchedSpeaker.id,
+            request.auth.organization.id,
+            verification.changes
+          ));
+        }
+      }
+      const verificationMessages = {
+        independent_probe: "등록과 다른 음성으로 실사용 검증을 기록했습니다.",
+        not_confirmed: "식별 결과만 확인했습니다. 별도 녹음 확인을 선택하지 않아 검증 횟수에는 반영하지 않았습니다.",
+        enrollment_audio: "등록에 사용한 동일 음성이라 별도 환경 검증에는 반영하지 않았습니다.",
+        duplicate_probe: "이미 검증한 동일 음성이라 검증 횟수를 늘리지 않았습니다.",
+        needs_new_enrollment: "기존 프로필에는 등록 파일 지문이 없어 새 샘플을 추가한 뒤 별도 음성으로 다시 검증해 주세요.",
+        not_matched: "이름이 확정되지 않아 검증 기록을 변경하지 않았습니다."
+      };
       return response.json({
         identification: {
           matched: decision.accepted,
@@ -977,7 +1021,13 @@ app.post("/api/speakers/identify", requireTrustedOrigin, requireAuth, requireOrg
           reason: decision.reason,
           message: reasonMessages[decision.reason]
         },
-        quality
+        quality,
+        verification: {
+          recorded: verification.recorded,
+          reason: verification.reason,
+          message: verificationMessages[verification.reason]
+        },
+        speakerProfile
       });
     } catch (error) {
       console.error("Speaker identification probe failed:", error);
@@ -996,7 +1046,8 @@ app.post("/api/speakers/:id/samples", requireTrustedOrigin, requireAuth, require
     const pcm = await decodeToPcm(request.file.buffer);
     const duration = pcm.length / 2 / 16_000;
     if (duration < 5) return response.status(400).json({ error: "추가 음성은 한 사람의 말소리가 포함된 5초 이상이어야 합니다." });
-    const quality = analyzePcmQuality(new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2)));
+    const samples = new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2));
+    const quality = analyzePcmQuality(samples);
     if (!quality.usable) return response.status(422).json({ error: quality.warnings[0] || "추가 음성 품질이 충분하지 않습니다.", quality });
     const additional = await enrollProfile(pcm);
     const extension = assessSpeakerProfileExtension(
@@ -1020,14 +1071,15 @@ app.post("/api/speakers/:id/samples", requireTrustedOrigin, requireAuth, require
       latestAudioQuality: quality,
       latestEnrollmentAffinity: extension.targetAffinity,
       nearestOtherSpeakerAffinity: extension.nearestOther?.affinity ?? null,
-      enrollmentSessions: [...(existing.enrollmentSessions || []), { duration, qualityScore: quality.score, enrolledAt: now }].slice(-8)
+      enrollmentSessions: [...(existing.enrollmentSessions || []), { duration, qualityScore: quality.score, enrolledAt: now }].slice(-8),
+      enrollmentFingerprints: [...(existing.enrollmentFingerprints || []), speakerProbeFingerprint(samples)].slice(-8)
     };
     delete updated.profile;
     delete updated.profiles;
     delete updated.referenceAudio;
     const referenceAudio = quality.score > (existing.audioQuality?.score || 0) ? pcmToWave(pcm) : existing.referenceAudio;
     const storedSpeaker = await speakerStore.replace(updated, profileBuffer, referenceAudio, request.auth.organization.id);
-    return response.json({ speaker: storedSpeaker });
+    return response.json({ speaker: publicSpeakerProfile(storedSpeaker) });
   } catch (error) {
     console.error("Speaker sample enrollment failed:", error);
     return response.status(422).json({ error: error.message || "추가 목소리를 등록하지 못했습니다." });

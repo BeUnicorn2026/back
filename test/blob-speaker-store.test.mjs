@@ -86,3 +86,15 @@ test("switches Blob profile versions after a complete replacement", async () => 
   assert.deepEqual(Array.from(loaded.profile), [0, 1]);
   assert.deepEqual(loaded.referenceAudio, Buffer.from("new-reference"));
 });
+
+test("updates Blob verification metadata without changing payload versions", async () => {
+  const client = memoryBlobClient();
+  const store = new BlobSpeakerStore({ token: "test-token", encryptionKey: randomBytes(32).toString("base64"), client });
+  await store.save(metadata, Buffer.from(new Float32Array([1, 0]).buffer), Buffer.from("reference"));
+  const before = (await store.list("org-a"))[0];
+  assert.equal(await store.updateMetadata(metadata.id, "org-b", { crossSessionVerificationCount: 1 }), null);
+  const updated = await store.updateMetadata(metadata.id, "org-a", { crossSessionVerificationCount: 1 });
+  assert.equal(updated.crossSessionVerificationCount, 1);
+  assert.equal(updated.storage.version, before.storage.version);
+  assert.equal(client.objects.size, 3);
+});
