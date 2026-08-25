@@ -1,0 +1,32 @@
+[Unit]
+Description=Voice Partition backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Unicorn/current
+EnvironmentFile=%h/Unicorn/config/backend.env
+Environment=NODE_ENV=development
+Environment=NODE_OPTIONS=--max-old-space-size=512
+Environment=PATH=%h/Unicorn/runtime/node/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/Unicorn/runtime/node/bin/node server.mjs
+Restart=always
+RestartSec=5s
+TimeoutStopSec=20s
+KillSignal=SIGTERM
+MemoryHigh=768M
+MemoryMax=1G
+MemorySwapMax=0
+TasksMax=256
+LimitNOFILE=32768
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/Unicorn/data %h/Unicorn/cache
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=default.target

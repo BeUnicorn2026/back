@@ -1,0 +1,19 @@
+[Unit]
+Description=Deploy the latest verified Voice Partition backend revision
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/Unicorn/runtime/node/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/Unicorn/back/deploy/bare/update.sh
+MemoryMax=640M
+MemorySwapMax=0
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/Unicorn/back %h/Unicorn/releases %h/Unicorn/current
+RestrictSUIDSGID=true
+LockPersonality=true
