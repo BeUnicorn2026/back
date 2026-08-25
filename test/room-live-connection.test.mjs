@@ -164,6 +164,92 @@ test("accepted canonical phrase persists and reaches room output exactly once", 
   }
 });
 
+test("disabled recognition keeps room STT running without loading the speaker model", async () => {
+  const client = new FakeSocket();
+  const provider = new FakeSocket();
+  const persisted = [];
+  let providerUrl = "";
+
+  try {
+    await handleSelfOnlyRoomLive({
+      client,
+      requestUrl: new URL("http://localhost/api/live?roomId=room-a"),
+      auth: { user: { id: "user-owner", name: "Owner" }, organization: { id: "org-a" } },
+      room: { id: "room-a" },
+      meeting: { id: "meeting-a" },
+      canonicalProfile: {
+        id: "profile-owner", speakerProfileId: "profile-owner", createdBy: "user-owner",
+        userId: "user-owner", name: "Owner", displayName: "Owner", profiles: []
+      },
+      meetingStore: {
+        async appendAcceptedSegment(_meetingId, _organizationId, segment) {
+          const accepted = { ...segment, sequence: persisted.length };
+          persisted.push(accepted);
+          return accepted;
+        }
+      },
+      async prepareSpeakerModel() {
+        assert.fail("speaker model must stay disabled");
+      },
+      speakerRecognitionEnabled: false,
+      speakerModelInfo: { sampleRate: 16_000, defaultMatchThreshold: 0.72, defaultMatchMargin: 0.04 },
+      speakerInferenceInfo: { windowSeconds: 1, realtimeMaximumEmbeddings: 3 },
+      deepgramApiKey: "test-only-placeholder",
+      hubConnection: {
+        async acceptFinalSegment(segment, persist) { return persist(segment); },
+        async release() {}
+      },
+      createProvider(url) {
+        providerUrl = url;
+        return provider;
+      }
+    });
+
+    provider.emit("open");
+    provider.emit("message", JSON.stringify({
+      type: "Results",
+      is_final: true,
+      metadata: { request_id: "stt-final" },
+      channel: {
+        alternatives: [{
+          words: [{ word: "모델 없이 받아쓰기", start: 0, end: 1, confidence: 0.98 }]
+        }]
+      }
+    }));
+    provider.emit("message", JSON.stringify({
+      type: "Results",
+      is_final: true,
+      metadata: { request_id: "stt-final" },
+      channel: {
+        alternatives: [{
+          words: [{ word: "모델 없이 받아쓰기", start: 0, end: 1, confidence: 0.98 }]
+        }]
+      }
+    }));
+
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(persisted.length, 1);
+    assert.deepEqual(persisted[0], {
+      speaker: "Owner",
+      known: true,
+      confidence: null,
+      sourceSpeaker: null,
+      start: 0,
+      end: 1,
+      text: "모델 없이 받아쓰기",
+      transcriptConfidence: 0.98,
+      userId: "user-owner",
+      speakerProfileId: "profile-owner",
+      displayName: "Owner",
+      sequence: 0
+    });
+    assert.doesNotMatch(providerUrl, /diarize=true/);
+  } finally {
+    client.close();
+    if (provider.readyState !== WebSocket.CLOSED) provider.close();
+  }
+});
+
 test("finalize is stream-local, idempotent, and rejects later audio", async () => {
   const client = new FakeSocket();
   const provider = new FakeSocket();

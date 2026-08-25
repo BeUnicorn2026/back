@@ -160,9 +160,13 @@ const tossPayments = new TossPaymentsClient({
 });
 const speakerModelCache = process.env.SPEAKER_MODEL_CACHE || path.join(projectDirectory, ".cache", "speaker-models");
 const speakerModelPath = process.env.SPEAKER_MODEL_PATH || "";
-const shouldPreloadSpeakerModel = process.env.PRELOAD_SPEAKER_MODEL === "true"
-  || (process.env.NODE_ENV === "production" && process.env.PRELOAD_SPEAKER_MODEL !== "false");
-let speakerModelState = "idle";
+// 화자 recognition 모델은 판정 품질을 다시 검증할 때까지 비활성화한다.
+// const speakerRecognitionEnabled = process.env.SPEAKER_RECOGNITION_ENABLED !== "false";
+// const shouldPreloadSpeakerModel = process.env.PRELOAD_SPEAKER_MODEL === "true"
+//   || (process.env.NODE_ENV === "production" && process.env.PRELOAD_SPEAKER_MODEL !== "false");
+const speakerRecognitionEnabled = false;
+const shouldPreloadSpeakerModel = false;
+let speakerModelState = "disabled";
 let speakerModelFailure = null;
 
 async function prepareSpeakerModel() {
@@ -538,7 +542,9 @@ async function transcribeAudioFile(file, language, organizationId) {
   form.append("chunking_strategy", "auto");
   if (language) form.append("language", language);
 
-  const allKnownSpeakers = await loadCurrentSpeakerProfiles(organizationId);
+  // 화자 recognition 재활성화 시 등록 음성 참조와 후처리 판정을 복구한다.
+  // const allKnownSpeakers = await loadCurrentSpeakerProfiles(organizationId);
+  const allKnownSpeakers = [];
   const knownSpeakerReferences = [];
   for (const speaker of allKnownSpeakers) {
     if (knownSpeakerReferences.length >= 4) break;
@@ -581,19 +587,20 @@ async function transcribeAudioFile(file, language, organizationId) {
     throw error;
   }
   const normalized = normalizeTranscript(payload, { knownSpeakers: knownSpeakerReferences.map(({ name }) => name) });
-  if (!allKnownSpeakers.length) return normalized;
-  try {
-    const decoded = await decodeToPcm(file.buffer, 1_800);
-    const originalPcm = new Int16Array(decoded.buffer, decoded.byteOffset, Math.floor(decoded.byteLength / 2));
-    const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath);
-    return await reconcileTranscriptSpeakers(normalized, originalPcm, allKnownSpeakers, model, {
-      threshold: Number(process.env.SPEAKER_MATCH_THRESHOLD) || speakerModelInfo.defaultMatchThreshold,
-      margin: Number(process.env.SPEAKER_MATCH_MARGIN) || speakerModelInfo.defaultMatchMargin
-    });
-  } catch (speakerError) {
-    console.error("Final speaker reconciliation failed:", speakerError);
-    return normalized;
-  }
+  // if (!allKnownSpeakers.length) return normalized;
+  // try {
+  //   const decoded = await decodeToPcm(file.buffer, 1_800);
+  //   const originalPcm = new Int16Array(decoded.buffer, decoded.byteOffset, Math.floor(decoded.byteLength / 2));
+  //   const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath);
+  //   return await reconcileTranscriptSpeakers(normalized, originalPcm, allKnownSpeakers, model, {
+  //     threshold: Number(process.env.SPEAKER_MATCH_THRESHOLD) || speakerModelInfo.defaultMatchThreshold,
+  //     margin: Number(process.env.SPEAKER_MATCH_MARGIN) || speakerModelInfo.defaultMatchMargin
+  //   });
+  // } catch (speakerError) {
+  //   console.error("Final speaker reconciliation failed:", speakerError);
+  //   return normalized;
+  // }
+  return normalized;
 }
 
 function transcriptionErrorResponse(error, response) {
@@ -1509,6 +1516,12 @@ app.post("/api/speakers", requireTrustedOrigin, requireAuth, requireOrganization
 
 app.post("/api/speakers/identify", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
   speakerIdentificationRateLimit, upload.single("voice"), async (request, response) => {
+    if (!speakerRecognitionEnabled) {
+      return response.status(503).json({
+        error: "목소리 인식 기능을 일시 중지했습니다.",
+        code: "SPEAKER_RECOGNITION_DISABLED"
+      });
+    }
     if (!request.file) return response.status(400).json({ error: "식별할 MP3 또는 WAV 음성이 필요합니다." });
     try {
       const speakers = await loadCurrentSpeakerProfiles(request.auth.organization.id);
@@ -1734,11 +1747,12 @@ await Promise.all([
 const server = app.listen(port, () => {
   console.log(`Voice Partition is running at http://localhost:${port}`);
 });
-if (shouldPreloadSpeakerModel) {
-  prepareSpeakerModel()
-    .then(() => console.log(JSON.stringify({ level: "info", event: "speaker_model_ready", model: speakerModelInfo.id })))
-    .catch((error) => console.error(JSON.stringify({ level: "error", event: "speaker_model_failed", message: error.message })));
-}
+// 화자 recognition을 다시 켤 때 모델 사전 로드도 함께 복구한다.
+// if (shouldPreloadSpeakerModel) {
+//   prepareSpeakerModel()
+//     .then(() => console.log(JSON.stringify({ level: "info", event: "speaker_model_ready", model: speakerModelInfo.id })))
+//     .catch((error) => console.error(JSON.stringify({ level: "error", event: "speaker_model_failed", message: error.message })));
+// }
 
 const liveServer = new WebSocketServer({ noServer: true });
 const roomLiveHub = new RoomLiveHub();
@@ -1822,6 +1836,7 @@ liveServer.on("connection", async (client, request, requestUrl) => {
         canonicalProfile: canonical.profile,
         meetingStore,
         prepareSpeakerModel,
+        speakerRecognitionEnabled,
         speakerModelInfo,
         speakerInferenceInfo,
         maximumAudioBytes: billingAccess.entitlements.meetingDurationSeconds == null
@@ -1858,7 +1873,8 @@ liveServer.on("connection", async (client, request, requestUrl) => {
     if (!auth) throw new Error("로그인이 필요합니다.");
     if (!auth.organization) throw new Error("먼저 조직을 만들거나 가입해 주세요.");
     const billingAccess = await requireMeetingAllowance(auth.organization.id);
-    const mode = requestUrl.searchParams.get("mode") === "speaker" ? "speaker" : "stt";
+    // const mode = requestUrl.searchParams.get("mode") === "speaker" ? "speaker" : "stt";
+    const mode = "stt";
     const speakers = mode === "speaker" ? await loadCurrentSpeakerProfiles(auth.organization.id) : [];
     if (mode === "speaker" && !speakers.length) throw new Error("화자 식별 모드에는 등록 목소리가 한 명 이상 필요합니다.");
     // Real-time livemap bridge: zero overhead / zero requests when disabled.
