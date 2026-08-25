@@ -47,6 +47,7 @@ import { BillingError, BillingStore } from "./lib/billing-store.mjs";
 import { PostgresBillingStore } from "./lib/postgres-billing-store.mjs";
 import { publicBillingPlans } from "./lib/billing-plans.mjs";
 import { TossPaymentsClient, TossPaymentsError } from "./lib/toss-payments-client.mjs";
+import { entitlementPeriodStart, meetingAllowance, planEntitlements } from "./lib/plan-entitlements.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 7070;
@@ -331,6 +332,43 @@ function configuredServices() {
     knowledgeTwin: "evidence-v1",
     payments: tossPayments.mode
   };
+}
+
+async function billingSnapshot(organizationId, now = new Date()) {
+  const subscription = await billingStore.subscriptionForOrganization(organizationId, now);
+  const entitlements = planEntitlements(subscription);
+  const periodStart = entitlementPeriodStart(subscription, now);
+  const usedMeetings = await meetingStore.countSince(organizationId, periodStart);
+  return {
+    subscription,
+    entitlements,
+    periodStart,
+    meetingUsage: meetingAllowance(entitlements, usedMeetings)
+  };
+}
+
+async function requireMeetingAllowance(organizationId) {
+  const snapshot = await billingSnapshot(organizationId);
+  if (!snapshot.meetingUsage.allowed) {
+    throw new BillingError(
+      `${snapshot.entitlements.planId} 플랜의 현재 기간 회의 ${snapshot.meetingUsage.limit}회를 모두 사용했습니다.`,
+      402,
+      "PLAN_MEETING_LIMIT"
+    );
+  }
+  return snapshot;
+}
+
+async function requireDurationAllowance(organizationId, durationSeconds) {
+  const snapshot = await billingSnapshot(organizationId);
+  if (Number(durationSeconds) > snapshot.entitlements.meetingDurationSeconds) {
+    throw new BillingError(
+      `${snapshot.entitlements.planId} 플랜의 회의당 최대 녹음 시간을 초과했습니다.`,
+      402,
+      "PLAN_DURATION_LIMIT"
+    );
+  }
+  return snapshot;
 }
 
 function publicSpeakerProfile(speaker) {
@@ -625,9 +663,21 @@ app.get("/api/session", optionalAuth, async (request, response) => {
 });
 
 app.get("/api/billing", requireAuth, requireOrganization, async (request, response) => {
+  const snapshot = await billingSnapshot(request.auth.organization.id);
+  const speakerCount = (await speakerStore.list(request.auth.organization.id)).length;
   response.json({
     plans: publicBillingPlans(),
-    subscription: await billingStore.subscriptionForOrganization(request.auth.organization.id),
+    subscription: snapshot.subscription,
+    entitlements: snapshot.entitlements,
+    usage: {
+      meetings: snapshot.meetingUsage,
+      speakers: {
+        used: speakerCount,
+        limit: snapshot.entitlements.speakerProfiles,
+        remaining: Math.max(0, snapshot.entitlements.speakerProfiles - speakerCount)
+      },
+      periodStart: snapshot.periodStart
+    },
     payment: tossPayments.publicConfiguration()
   });
 });
@@ -950,6 +1000,7 @@ app.get("/api/meetings/:id", requireAuth, requireOrganization, async (request, r
 });
 
 app.post("/api/meetings", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
+  await requireMeetingAllowance(request.auth.organization.id);
   const meeting = await meetingStore.create({
     organizationId: request.auth.organization.id,
     createdBy: request.auth.user.id,
@@ -970,9 +1021,11 @@ app.post("/api/meetings/import", requireTrustedOrigin, requireAuth, requireOrgan
       if (!/^[a-f0-9-]{36}$/i.test(importKey)) return response.status(400).json({ error: "유효한 업로드 ID가 필요합니다." });
       const existing = await meetingStore.getByImportKey(request.auth.organization.id, importKey);
       if (existing) return response.json({ meeting: existing, duplicate: true });
+      await requireMeetingAllowance(request.auth.organization.id);
       if (!process.env.OPENAI_API_KEY) return response.status(503).json({ error: "OPENAI_API_KEY가 설정되지 않았습니다." });
       const transcription = await transcribeAudioFile(request.file, language, request.auth.organization.id);
       if (!transcription.segments?.length) return response.status(422).json({ error: "인식된 대화가 없습니다." });
+      await requireDurationAllowance(request.auth.organization.id, transcription.duration);
       const meeting = await meetingStore.createCompleted({
         organizationId: request.auth.organization.id,
         createdBy: request.auth.user.id,
@@ -986,11 +1039,13 @@ app.post("/api/meetings/import", requireTrustedOrigin, requireAuth, requireOrgan
       });
       return response.status(201).json({ meeting });
     } catch (error) {
+      if (error instanceof BillingError) throw error;
       return transcriptionErrorResponse(error, response);
     }
   });
 
 app.patch("/api/meetings/:id", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
+  if (request.body?.duration != null) await requireDurationAllowance(request.auth.organization.id, request.body.duration);
   const meeting = await meetingStore.update(request.params.id, request.auth.organization.id, request.body || {});
   if (!meeting) return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
   response.json({ meeting });
@@ -1061,6 +1116,14 @@ app.post("/api/speakers", requireTrustedOrigin, requireAuth, requireOrganization
 
   try {
     const existing = await loadCurrentSpeakerProfiles(request.auth.organization.id);
+    const access = await billingSnapshot(request.auth.organization.id);
+    if (existing.length >= access.entitlements.speakerProfiles) {
+      throw new BillingError(
+        `${access.entitlements.planId} 플랜은 등록 화자를 ${access.entitlements.speakerProfiles}명까지 지원합니다.`,
+        402,
+        "PLAN_SPEAKER_LIMIT"
+      );
+    }
     if (existing.some((speaker) => speaker.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
       return response.status(409).json({ error: "이미 등록된 이름입니다." });
     }
@@ -1107,6 +1170,7 @@ app.post("/api/speakers", requireTrustedOrigin, requireAuth, requireOrganization
     const storedSpeaker = await speakerStore.save(speaker, profile.buffer, referenceAudio);
     return response.status(201).json({ speaker: publicSpeakerProfile(storedSpeaker) });
   } catch (error) {
+    if (error instanceof BillingError) throw error;
     console.error("Speaker enrollment failed:", error);
     return response.status(422).json({ error: error.message || "목소리를 등록하지 못했습니다." });
   }
@@ -1287,8 +1351,11 @@ app.post("/api/transcribe", requireTrustedOrigin, requireAuth, requireOrganizati
 
   try {
     const language = typeof request.body?.language === "string" ? request.body.language.trim() : "";
-    return response.json(await transcribeAudioFile(request.file, language, request.auth.organization.id));
+    const transcription = await transcribeAudioFile(request.file, language, request.auth.organization.id);
+    await requireDurationAllowance(request.auth.organization.id, transcription.duration);
+    return response.json(transcription);
   } catch (error) {
+    if (error instanceof BillingError) throw error;
     return transcriptionErrorResponse(error, response);
   }
 });
@@ -1359,6 +1426,7 @@ liveServer.on("connection", async (client, request, requestUrl) => {
     const auth = await authStore.getContextBySession(sessionToken(request));
     if (!auth) throw new Error("로그인이 필요합니다.");
     if (!auth.organization) throw new Error("먼저 조직을 만들거나 가입해 주세요.");
+    const billingAccess = await requireMeetingAllowance(auth.organization.id);
     const mode = requestUrl.searchParams.get("mode") === "speaker" ? "speaker" : "stt";
     const speakers = mode === "speaker" ? await loadCurrentSpeakerProfiles(auth.organization.id) : [];
     if (mode === "speaker" && !speakers.length) throw new Error("화자 식별 모드에는 등록 목소리가 한 명 이상 필요합니다.");
@@ -1456,6 +1524,8 @@ liveServer.on("connection", async (client, request, requestUrl) => {
     });
 
     let transcriptQueue = Promise.resolve();
+    let forwardedAudioBytes = 0;
+    const maximumAudioBytes = billingAccess.entitlements.meetingDurationSeconds * speakerModelInfo.sampleRate * 2;
     let finalizationAcknowledged = false;
     let diarizationWarningSent = false;
     const acknowledgeFinalization = () => {
@@ -1577,6 +1647,21 @@ liveServer.on("connection", async (client, request, requestUrl) => {
         return;
       }
       const incoming = Buffer.from(data);
+      if (forwardedAudioBytes + incoming.length > maximumAudioBytes) {
+        const closeProvider = () => {
+          if (deepgram.readyState === WebSocket.OPEN) deepgram.close(1000, "plan duration reached");
+        };
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({
+            type: "error",
+            code: "PLAN_DURATION_LIMIT",
+            message: `${billingAccess.entitlements.planId} 플랜의 회의당 최대 녹음 시간에 도달해 현재 기록을 저장합니다.`
+          }), closeProvider);
+        } else {
+          closeProvider();
+        }
+        return;
+      }
       if (!canForwardLiveAudio(deepgram)) {
         const closeProvider = () => {
           if (deepgram.readyState === WebSocket.OPEN) deepgram.close(1011, "audio backpressure");
@@ -1592,13 +1677,18 @@ liveServer.on("connection", async (client, request, requestUrl) => {
         return;
       }
       deepgram.send(incoming);
+      forwardedAudioBytes += incoming.length;
       providerKeepAlive?.markAudioForwarded();
       if (mode !== "speaker") return;
       audioHistory.append(incoming);
     });
   } catch (error) {
     console.error("Live session failed:", error);
-    if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: "error", message: error.message }));
+    if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({
+      type: "error",
+      message: error.message,
+      ...(error.code ? { code: error.code } : {})
+    }));
     client.close(1011);
   }
 

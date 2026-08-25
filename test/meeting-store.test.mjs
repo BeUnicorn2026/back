@@ -35,6 +35,8 @@ test("persists and isolates organization meetings", async () => {
   assert.equal(staleAutosave.segments[0].text, "실제 회의를 저장합니다.");
   assert.equal((await store.list("org-a")).length, 1);
   assert.equal((await store.list("org-b")).length, 0);
+  assert.equal(await store.countSince("org-a", "2000-01-01T00:00:00.000Z"), 1);
+  assert.equal(await store.countSince("org-a", "2999-01-01T00:00:00.000Z"), 0);
   assert.equal(await store.get(meeting.id, "org-b"), null);
 
   const hash = transcriptHash(updated.segments);
