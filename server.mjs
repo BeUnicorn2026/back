@@ -37,6 +37,7 @@ import { createConcurrencyLimit } from "./lib/concurrency-limit.mjs";
 import { expectedSpeakerScore, recordingEnvelopeSimilarity, speakerProbeFingerprint, speakerVerificationUpdate } from "./lib/speaker-verification.mjs";
 import { sessionCookiePolicy } from "./lib/session-cookie-policy.mjs";
 import { speakerRegionSampleRange } from "./lib/live-speaker-regions.mjs";
+import { isSupportedAudioUpload } from "./lib/audio-upload.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 3001;
@@ -120,16 +121,11 @@ async function prepareSpeakerModel() {
   }
 }
 const maxAudioBytes = 25 * 1024 * 1024;
-const supportedMimeTypes = new Set([
-  "audio/flac", "audio/m4a", "audio/mp3", "audio/mp4", "audio/mpeg",
-  "audio/ogg", "audio/wav", "audio/x-wav", "audio/webm", "video/mp4", "video/webm"
-]);
-
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: maxAudioBytes, files: 1 },
   fileFilter(_request, file, callback) {
-    callback(null, supportedMimeTypes.has(file.mimetype));
+    callback(null, isSupportedAudioUpload(file));
   }
 });
 
