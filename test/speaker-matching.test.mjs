@@ -39,6 +39,40 @@ test("uses enrollment-specific thresholds and stabilizes a diarized speaker clus
   assert.equal(tracker.identify(1, [0.2, 0.91], speakers)?.name, "지수");
 });
 
+test("does not count the same acoustic frame once per transcript word", () => {
+  const tracker = new SpeakerIdentityTracker();
+  const frame = { start: 0, end: 1, sourceSpeaker: "0", scores: [0.76, 0.7], weight: 1 };
+  const first = wordsToSegments([
+    { start: 0.1, end: 0.3, word: "같은", speaker: 0 },
+    { start: 0.35, end: 0.55, word: "관측", speaker: 0 },
+    { start: 0.6, end: 0.8, word: "입니다", speaker: 0 }
+  ], [frame], speakers, { tracker });
+  assert.ok(first.every(({ speaker }) => speaker === "미등록 화자 A"));
+
+  const repeated = wordsToSegments([
+    { start: 0.15, end: 0.4, word: "다시", speaker: 0 }
+  ], [frame], speakers, { tracker });
+  assert.equal(repeated[0].speaker, "미등록 화자 A");
+
+  const independentFrame = { start: 1.1, end: 2.2, sourceSpeaker: "0", scores: [0.84, 0.58], weight: 1.1 };
+  const confirmed = wordsToSegments([
+    { start: 1.2, end: 1.8, word: "확인", speaker: 0 }
+  ], [independentFrame], speakers, { tracker });
+  assert.equal(confirmed[0].speaker, "민수");
+});
+
+test("accepts one short observation only when its identity evidence is strong", () => {
+  const uncertain = new SpeakerIdentityTracker();
+  assert.equal(uncertain.identify("0", [0.76, 0.69], speakers, {
+    observationId: "short-uncertain", observationWeight: 1
+  }), null);
+
+  const strong = new SpeakerIdentityTracker();
+  assert.equal(strong.identify("0", [0.91, 0.3], speakers, {
+    observationId: "short-strong", observationWeight: 1
+  })?.name, "민수");
+});
+
 test("manual cluster correction overrides later model scores without claiming model confidence", () => {
   const tracker = new SpeakerIdentityTracker();
   assert.equal(tracker.identify(0, [0.91, 0.2], speakers)?.name, "민수");
