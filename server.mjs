@@ -32,6 +32,7 @@ import { personalizeKnowledgeTerms } from "./lib/knowledge-personalization.mjs";
 import { KnowledgeExplanationService, knowledgeExplanationCacheKey } from "./lib/knowledge-explanation.mjs";
 import { normalizeUploadFilename, uploadTitle } from "./lib/upload-filename.mjs";
 import { serviceReadiness } from "./lib/service-readiness.mjs";
+import { createConcurrencyLimit } from "./lib/concurrency-limit.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 3001;
@@ -207,6 +208,10 @@ const knowledgeExplanationRateLimit = rateLimit("knowledge-explanation", { limit
   request.auth?.user?.id || request.ip);
 const transcriptionRateLimit = rateLimit("transcription", { limit: 12, windowMs: 60 * 60_000 }, (request) =>
   `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
+const transcriptionConcurrencyLimit = createConcurrencyLimit(
+  Math.min(4, Number(process.env.TRANSCRIPTION_CONCURRENCY) || 2),
+  { code: "TRANSCRIPTION_BUSY", message: "동시에 처리 중인 전사가 많습니다. 잠시 후 다시 시도해 주세요." }
+);
 
 app.use((request, response, next) => {
   const startedAt = performance.now();
@@ -417,9 +422,9 @@ async function transcribeAudioFile(file, language, organizationId) {
   if (!allKnownSpeakers.length) return normalized;
   try {
     const decoded = await decodeToPcm(file.buffer, 1_800);
-    const pcm = new Int16Array(decoded.buffer, decoded.byteOffset, Math.floor(decoded.byteLength / 2));
+    const originalPcm = new Int16Array(decoded.buffer, decoded.byteOffset, Math.floor(decoded.byteLength / 2));
     const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath);
-    return await reconcileTranscriptSpeakers(normalized, pcm, allKnownSpeakers, model, {
+    return await reconcileTranscriptSpeakers(normalized, originalPcm, allKnownSpeakers, model, {
       threshold: Number(process.env.SPEAKER_MATCH_THRESHOLD) || 0.72,
       margin: Number(process.env.SPEAKER_MATCH_MARGIN) || 0.04
     });
@@ -816,7 +821,7 @@ app.post("/api/meetings", requireTrustedOrigin, requireAuth, requireOrganization
 });
 
 app.post("/api/meetings/import", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
-  transcriptionRateLimit, upload.single("audio"), async (request, response) => {
+  transcriptionRateLimit, transcriptionConcurrencyLimit, upload.single("audio"), async (request, response) => {
     if (!request.file) return response.status(400).json({ error: "지원되는 오디오 파일이 필요합니다." });
     try {
       const language = typeof request.body?.language === "string" ? request.body.language.trim() : "";
@@ -1037,7 +1042,7 @@ app.delete("/api/speakers/:id", requireTrustedOrigin, requireAuth, requireOrgani
 });
 
 app.post("/api/transcribe", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
-  transcriptionRateLimit, upload.single("audio"), async (request, response) => {
+  transcriptionRateLimit, transcriptionConcurrencyLimit, upload.single("audio"), async (request, response) => {
   if (!process.env.OPENAI_API_KEY) return response.status(503).json({ error: "OPENAI_API_KEY가 설정되지 않았습니다." });
   if (!request.file) return response.status(400).json({ error: "지원되는 오디오 파일이 필요합니다." });
 
