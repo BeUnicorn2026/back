@@ -6,10 +6,10 @@ cp .env.example .env
 npm run dev
 ```
 
-For a separate production frontend origin:
+For production, set the exact frontend origin. Cross-origin production sessions automatically use a secure `SameSite=None` cookie:
 
 ```bash
-PUBLIC_ORIGIN=https://app.example.com SESSION_COOKIE_SAME_SITE=none npm start
+PUBLIC_ORIGIN=https://app.example.com npm start
 ```
 
 ```bash

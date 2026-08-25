@@ -25,11 +25,12 @@ test("development readiness allows intentionally unconfigured providers", () => 
 test("reports every missing production environment variable at once", () => {
   const missing = productionEnvironmentIssues("production", { SPEAKER_STORAGE: "blob" });
   assert.deepEqual(missing, [
-    "EMAIL_VERIFICATION_SECRET", "VOICE_BIOMETRIC_KEY", "DEEPGRAM_API_KEY",
+    "PUBLIC_ORIGIN", "EMAIL_VERIFICATION_SECRET", "VOICE_BIOMETRIC_KEY", "DEEPGRAM_API_KEY",
     "OPENAI_API_KEY", "RESEND_API_KEY", "RESEND_FROM_EMAIL", "BLOB_READ_WRITE_TOKEN"
   ]);
   assert.deepEqual(productionEnvironmentIssues("development", {}), []);
   assert.deepEqual(productionEnvironmentIssues("production", {
+    PUBLIC_ORIGIN: "https://app.example.com",
     EMAIL_VERIFICATION_SECRET: "configured",
     VOICE_BIOMETRIC_KEY: "configured",
     DEEPGRAM_API_KEY: "configured",

@@ -35,6 +35,7 @@ import { normalizeUploadFilename, uploadTitle } from "./lib/upload-filename.mjs"
 import { productionEnvironmentIssues, serviceReadiness } from "./lib/service-readiness.mjs";
 import { createConcurrencyLimit } from "./lib/concurrency-limit.mjs";
 import { recordingEnvelopeSimilarity, speakerProbeFingerprint, speakerVerificationUpdate } from "./lib/speaker-verification.mjs";
+import { sessionCookiePolicy } from "./lib/session-cookie-policy.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 3001;
@@ -261,25 +262,24 @@ function sessionToken(request) {
   return parseCookies(request.headers.cookie)[sessionCookieName] || "";
 }
 
-function setSessionCookie(response, token, expiresAt) {
-  const sameSite = ["lax", "strict", "none"].includes(process.env.SESSION_COOKIE_SAME_SITE) ? process.env.SESSION_COOKIE_SAME_SITE : "lax";
-  response.cookie(sessionCookieName, token, {
-    httpOnly: true,
-    sameSite,
-    secure: process.env.NODE_ENV === "production",
-    expires: new Date(expiresAt),
-    path: "/"
+function sessionCookieOptions(request) {
+  return sessionCookiePolicy({
+    environment: process.env.NODE_ENV,
+    configuredSameSite: process.env.SESSION_COOKIE_SAME_SITE,
+    serverOrigin: requestOrigin(request),
+    clientOrigin: request.headers.origin
   });
 }
 
-function clearSessionCookie(response) {
-  const sameSite = ["lax", "strict", "none"].includes(process.env.SESSION_COOKIE_SAME_SITE) ? process.env.SESSION_COOKIE_SAME_SITE : "lax";
-  response.clearCookie(sessionCookieName, {
-    httpOnly: true,
-    sameSite,
-    secure: process.env.NODE_ENV === "production",
-    path: "/"
+function setSessionCookie(request, response, token, expiresAt) {
+  response.cookie(sessionCookieName, token, {
+    ...sessionCookieOptions(request),
+    expires: new Date(expiresAt)
   });
+}
+
+function clearSessionCookie(request, response) {
+  response.clearCookie(sessionCookieName, sessionCookieOptions(request));
 }
 
 async function optionalAuth(request, _response, next) {
@@ -516,7 +516,7 @@ app.post("/api/auth/signup", requireTrustedOrigin, signupRateLimit, async (reque
 app.post("/api/auth/verify-email", requireTrustedOrigin, verificationRateLimit, async (request, response) => {
   const user = await authStore.verifyEmail(request.body?.email, request.body?.code);
   const session = await authStore.createSession(user.id);
-  setSessionCookie(response, session.token, session.expiresAt);
+  setSessionCookie(request, response, session.token, session.expiresAt);
   response.json(await authStore.getContextBySession(session.token));
 });
 
@@ -541,13 +541,13 @@ app.post("/api/auth/verification/resend", requireTrustedOrigin, verificationRese
 app.post("/api/auth/login", requireTrustedOrigin, loginRateLimit, async (request, response) => {
   const user = await authStore.authenticate(request.body?.email, request.body?.password);
   const session = await authStore.createSession(user.id);
-  setSessionCookie(response, session.token, session.expiresAt);
+  setSessionCookie(request, response, session.token, session.expiresAt);
   response.json(await authStore.getContextBySession(session.token));
 });
 
 app.post("/api/auth/logout", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
   await authStore.deleteSession(sessionToken(request));
-  clearSessionCookie(response);
+  clearSessionCookie(request, response);
   response.status(204).end();
 });
 
