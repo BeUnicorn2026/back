@@ -39,6 +39,35 @@ test("uses enrollment-specific thresholds and stabilizes a diarized speaker clus
   assert.equal(tracker.identify(1, [0.2, 0.91], speakers)?.name, "지수");
 });
 
+test("ignores one contradictory frame but switches after repeated strong evidence", () => {
+  const tracker = new SpeakerIdentityTracker();
+  assert.equal(tracker.identify("cluster", [0.93, 0.21], speakers, {
+    observationId: "initial", observationWeight: 1
+  })?.name, "민수");
+
+  assert.equal(tracker.identify("cluster", [0.18, 0.94], speakers, {
+    observationId: "contradiction-1", observationWeight: 1
+  })?.name, "민수");
+  assert.equal(tracker.identify("cluster", [0.2, 0.92], speakers, {
+    observationId: "contradiction-2", observationWeight: 1
+  })?.name, "지수");
+});
+
+test("does not accumulate alternating contradictory speakers into a switch", () => {
+  const threeSpeakers = [...speakers, { id: "three", name: "서준" }];
+  const tracker = new SpeakerIdentityTracker();
+  tracker.identify("cluster", [0.94, 0.2, 0.18], threeSpeakers, {
+    observationId: "initial", observationWeight: 1
+  });
+
+  assert.equal(tracker.identify("cluster", [0.15, 0.93, 0.2], threeSpeakers, {
+    observationId: "challenger-two", observationWeight: 1
+  })?.name, "민수");
+  assert.equal(tracker.identify("cluster", [0.16, 0.19, 0.94], threeSpeakers, {
+    observationId: "challenger-three", observationWeight: 1
+  })?.name, "민수");
+});
+
 test("does not count the same acoustic frame once per transcript word", () => {
   const tracker = new SpeakerIdentityTracker();
   const frame = { start: 0, end: 1, sourceSpeaker: "0", scores: [0.76, 0.7], weight: 1 };
