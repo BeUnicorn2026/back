@@ -43,9 +43,13 @@ import { selectSpeakerReferencePcm } from "./lib/speaker-reference.mjs";
 import { canForwardLiveAudio } from "./lib/live-audio-backpressure.mjs";
 import { buildDeepgramLiveQuery } from "./lib/deepgram-live-options.mjs";
 import { createDeepgramKeepAlive, deepgramApplicationError, parseDeepgramLiveEvent } from "./lib/deepgram-live-connection.mjs";
+import { BillingError, BillingStore } from "./lib/billing-store.mjs";
+import { PostgresBillingStore } from "./lib/postgres-billing-store.mjs";
+import { publicBillingPlans } from "./lib/billing-plans.mjs";
+import { TossPaymentsClient, TossPaymentsError } from "./lib/toss-payments-client.mjs";
 
 const app = express();
-const port = Number(process.env.PORT) || 3001;
+const port = Number(process.env.PORT) || 7070;
 const projectDirectory = path.dirname(fileURLToPath(import.meta.url));
 const dataDirectory = process.env.VOICE_PARTITION_DATA_DIR
   ? path.resolve(process.env.VOICE_PARTITION_DATA_DIR)
@@ -88,6 +92,9 @@ const meetingStore = postgresDatabase
 const knowledgeStore = postgresDatabase
   ? new PostgresKnowledgeStore(postgresDatabase)
   : new KnowledgeStore(databasePath);
+const billingStore = postgresDatabase
+  ? new PostgresBillingStore(postgresDatabase)
+  : new BillingStore(databasePath);
 const requestRateLimiter = postgresDatabase
   ? new PostgresRequestRateLimiter(postgresDatabase)
   : new RequestRateLimiter(databasePath);
@@ -104,6 +111,10 @@ const meetingIntelligenceService = new MeetingIntelligenceService({
 const knowledgeExplanationService = new KnowledgeExplanationService({
   apiKey: process.env.OPENAI_API_KEY,
   model: process.env.OPENAI_EXPLANATION_MODEL || process.env.OPENAI_ANALYSIS_MODEL
+});
+const tossPayments = new TossPaymentsClient({
+  clientKey: process.env.TOSS_CLIENT_KEY,
+  secretKey: process.env.TOSS_SECRET_KEY
 });
 const speakerModelCache = process.env.SPEAKER_MODEL_CACHE || path.join(projectDirectory, ".cache", "speaker-models");
 const speakerModelPath = process.env.SPEAKER_MODEL_PATH || "";
@@ -216,6 +227,8 @@ const knowledgeExplanationRateLimit = rateLimit("knowledge-explanation", { limit
   request.auth?.user?.id || request.ip);
 const transcriptionRateLimit = rateLimit("transcription", { limit: 12, windowMs: 60 * 60_000 }, (request) =>
   `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
+const billingOrderRateLimit = rateLimit("billing-order", { limit: 10, windowMs: 60 * 60_000 }, (request) =>
+  `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
 const transcriptionConcurrencyLimit = createConcurrencyLimit(
   Math.min(4, Number(process.env.TRANSCRIPTION_CONCURRENCY) || 2),
   { code: "TRANSCRIPTION_BUSY", message: "동시에 처리 중인 전사가 많습니다. 잠시 후 다시 시도해 주세요." }
@@ -315,7 +328,8 @@ function configuredServices() {
     speakerModel: speakerModelInfo.id,
     speakerInference: speakerInferenceInfo,
     speakerModelState,
-    knowledgeTwin: "evidence-v1"
+    knowledgeTwin: "evidence-v1",
+    payments: tossPayments.mode
   };
 }
 
@@ -609,6 +623,59 @@ app.get("/api/session", optionalAuth, async (request, response) => {
   if (!request.auth) return response.json({ authenticated: false });
   response.json({ authenticated: true, ...request.auth });
 });
+
+app.get("/api/billing", requireAuth, requireOrganization, async (request, response) => {
+  response.json({
+    plans: publicBillingPlans(),
+    subscription: await billingStore.subscriptionForOrganization(request.auth.organization.id),
+    payment: tossPayments.publicConfiguration()
+  });
+});
+
+app.post("/api/billing/orders", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
+  billingOrderRateLimit, async (request, response) => {
+    const order = await billingStore.createOrder({
+      userId: request.auth.user.id,
+      organizationId: request.auth.organization.id,
+      planId: request.body?.planId
+    });
+    response.status(201).json({
+      orderId: order.orderId,
+      planId: order.planId,
+      amount: order.amount,
+      orderName: `SSU-ON ${order.planId} 30일 이용권`,
+      expiresAt: order.expiresAt
+    });
+  });
+
+app.post("/api/billing/confirm", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
+  billingOrderRateLimit, async (request, response) => {
+    const orderId = String(request.body?.orderId || "");
+    const paymentKey = String(request.body?.paymentKey || "");
+    const amount = Number(request.body?.amount);
+    if (!/^[A-Za-z0-9_-]{6,64}$/.test(orderId) || !paymentKey || paymentKey.length > 200 || !Number.isSafeInteger(amount)) {
+      throw new BillingError("올바른 결제 승인 정보가 필요합니다.", 400, "PAYMENT_CONFIRM_INVALID");
+    }
+    const claim = await billingStore.beginConfirmation({ orderId, userId: request.auth.user.id, amount });
+    if (claim.order.organizationId !== request.auth.organization.id) {
+      await billingStore.releaseConfirmation(orderId);
+      throw new BillingError("현재 조직의 결제 주문이 아닙니다.", 403, "PAYMENT_ORGANIZATION_MISMATCH");
+    }
+    if (claim.alreadyConfirmed) {
+      return response.json({
+        confirmed: true,
+        subscription: await billingStore.subscriptionForOrganization(request.auth.organization.id)
+      });
+    }
+    try {
+      const payment = await tossPayments.confirm({ paymentKey, orderId, amount: claim.order.amount });
+      const completed = await billingStore.completeConfirmation({ orderId, userId: request.auth.user.id, payment });
+      return response.json({ confirmed: true, subscription: completed.subscription });
+    } catch (error) {
+      await billingStore.releaseConfirmation(orderId);
+      throw error;
+    }
+  });
 
 app.get("/api/organizations/suggestion", requireAuth, async (request, response) => {
   response.json({ suggestion: await authStore.organizationSuggestion(request.auth.user.id) });
@@ -1242,6 +1309,9 @@ app.use((error, _request, response, _next) => {
   if (error instanceof EmailDeliveryError) {
     return response.status(502).json({ error: error.message, code: error.code });
   }
+  if (error instanceof BillingError || error instanceof TossPaymentsError) {
+    return response.status(error.status).json({ error: error.message, code: error.code });
+  }
   if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
     return response.status(413).json({ error: "오디오 파일은 25MB 이하여야 합니다." });
   }
@@ -1250,7 +1320,8 @@ app.use((error, _request, response, _next) => {
 });
 
 await Promise.all([
-  authStore.initialize(), speakerStore.initialize(), meetingStore.initialize(), knowledgeStore.initialize(), requestRateLimiter.initialize()
+  authStore.initialize(), speakerStore.initialize(), meetingStore.initialize(), knowledgeStore.initialize(),
+  billingStore.initialize(), requestRateLimiter.initialize()
 ]);
 const server = app.listen(port, () => {
   console.log(`Voice Partition is running at http://localhost:${port}`);
