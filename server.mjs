@@ -39,6 +39,7 @@ import { sessionCookiePolicy } from "./lib/session-cookie-policy.mjs";
 import { speakerRegionSampleRange } from "./lib/live-speaker-regions.mjs";
 import { isSupportedAudioUpload } from "./lib/audio-upload.mjs";
 import { selectSpeakerReferencePcm } from "./lib/speaker-reference.mjs";
+import { canForwardLiveAudio } from "./lib/live-audio-backpressure.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 3001;
@@ -1428,6 +1429,20 @@ liveServer.on("connection", async (client, request, requestUrl) => {
         return;
       }
       const incoming = Buffer.from(data);
+      if (!canForwardLiveAudio(deepgram)) {
+        const closeProvider = () => {
+          if (deepgram.readyState === WebSocket.OPEN) deepgram.close(1011, "audio backpressure");
+        };
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({
+            type: "error",
+            message: "STT 제공자 전송이 5초 이상 지연되어 현재 기록을 안전하게 종료합니다. 잠시 후 다시 시도해 주세요."
+          }), closeProvider);
+        } else {
+          closeProvider();
+        }
+        return;
+      }
       deepgram.send(incoming);
       if (mode !== "speaker") return;
       audioHistory.append(incoming);
