@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { serviceReadiness } from "../lib/service-readiness.mjs";
+import { productionEnvironmentIssues, serviceReadiness } from "../lib/service-readiness.mjs";
 
 test("production readiness requires every core meeting service", () => {
   const degraded = serviceReadiness({
@@ -20,4 +20,21 @@ test("production readiness requires every core meeting service", () => {
 
 test("development readiness allows intentionally unconfigured providers", () => {
   assert.equal(serviceReadiness({ environment: "development" }).ready, true);
+});
+
+test("reports every missing production environment variable at once", () => {
+  const missing = productionEnvironmentIssues("production", { SPEAKER_STORAGE: "blob" });
+  assert.deepEqual(missing, [
+    "EMAIL_VERIFICATION_SECRET", "VOICE_BIOMETRIC_KEY", "DEEPGRAM_API_KEY",
+    "OPENAI_API_KEY", "RESEND_API_KEY", "RESEND_FROM_EMAIL", "BLOB_READ_WRITE_TOKEN"
+  ]);
+  assert.deepEqual(productionEnvironmentIssues("development", {}), []);
+  assert.deepEqual(productionEnvironmentIssues("production", {
+    EMAIL_VERIFICATION_SECRET: "configured",
+    VOICE_BIOMETRIC_KEY: "configured",
+    DEEPGRAM_API_KEY: "configured",
+    OPENAI_API_KEY: "configured",
+    RESEND_API_KEY: "configured",
+    RESEND_FROM_EMAIL: "configured"
+  }), []);
 });

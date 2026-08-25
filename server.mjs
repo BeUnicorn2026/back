@@ -31,7 +31,7 @@ import { knowledgeTwinDefaults, normalizeConceptLabel } from "./lib/knowledge-tw
 import { personalizeKnowledgeTerms } from "./lib/knowledge-personalization.mjs";
 import { KnowledgeExplanationService, knowledgeExplanationCacheKey } from "./lib/knowledge-explanation.mjs";
 import { normalizeUploadFilename, uploadTitle } from "./lib/upload-filename.mjs";
-import { serviceReadiness } from "./lib/service-readiness.mjs";
+import { productionEnvironmentIssues, serviceReadiness } from "./lib/service-readiness.mjs";
 import { createConcurrencyLimit } from "./lib/concurrency-limit.mjs";
 import { speakerProbeFingerprint, speakerVerificationUpdate } from "./lib/speaker-verification.mjs";
 
@@ -44,9 +44,12 @@ const dataDirectory = process.env.VOICE_PARTITION_DATA_DIR
 const databasePath = process.env.VOICE_PARTITION_DATABASE_PATH
   ? path.resolve(process.env.VOICE_PARTITION_DATABASE_PATH)
   : path.join(dataDirectory, "voice-partition.sqlite");
+const missingProductionVariables = productionEnvironmentIssues(process.env.NODE_ENV, process.env);
+if (missingProductionVariables.length) {
+  throw new Error(`운영 환경 설정이 필요합니다: ${missingProductionVariables.join(", ")}`);
+}
 const emailVerificationSecret = process.env.EMAIL_VERIFICATION_SECRET
   || (process.env.NODE_ENV === "production" ? "" : "voice-partition-development-verification-secret");
-if (!emailVerificationSecret) throw new Error("운영 환경에는 EMAIL_VERIFICATION_SECRET이 필요합니다.");
 const databaseMode = process.env.DATABASE_URL ? "postgresql" : "sqlite";
 const postgresDatabase = databaseMode === "postgresql"
   ? new PostgresDatabase({
