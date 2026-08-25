@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { analyzePcmQuality, isSpeakerInferenceQuality } from "../lib/audio-quality.mjs";
+import { analyzePcmQuality, isSpeakerInferenceQuality, isSpeakerSignalQuality } from "../lib/audio-quality.mjs";
 
 function makePcm({ seconds = 6, amplitude = 5_000, voicedRatio = 0.6 } = {}) {
   const samples = new Int16Array(seconds * 16_000);
@@ -38,4 +38,10 @@ test("gates short speaker inference without applying the five second enrollment 
   assert.equal(quality.usable, false);
   assert.equal(isSpeakerInferenceQuality(quality), true);
   assert.equal(isSpeakerInferenceQuality(analyzePcmQuality(new Int16Array(32_000))), false);
+});
+
+test("allows clean short speech to accumulate before the inference duration gate", () => {
+  const quality = analyzePcmQuality(makePcm({ seconds: 0.6 }));
+  assert.equal(isSpeakerSignalQuality(quality), true);
+  assert.equal(isSpeakerInferenceQuality(quality), false);
 });

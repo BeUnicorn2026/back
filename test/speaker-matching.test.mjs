@@ -110,6 +110,29 @@ test("does not call the first two seconds an unknown speaker before identificati
   assert.equal(segment.speaker, "화자 확인 중");
 });
 
+test("keeps a short accumulated cluster in the checking state after the opening seconds", () => {
+  const tracker = new SpeakerIdentityTracker();
+  const [segment] = wordsToSegments(
+    [{ start: 8, end: 8.5, word: "짧은발화", speaker: 0 }],
+    [], speakers,
+    { tracker, pendingSpeakerClusters: new Set(["0"]) }
+  );
+  assert.equal(segment.speaker, "화자 확인 중");
+  assert.equal(tracker.hasEvidence("0"), false);
+});
+
+test("does not hide an evidence-backed rejection behind the checking state", () => {
+  const tracker = new SpeakerIdentityTracker();
+  tracker.identify("0", [0.55, 0.51], speakers, { observationId: "rejected", observationWeight: 2 });
+  const [segment] = wordsToSegments(
+    [{ start: 8, end: 8.5, word: "판정완료", speaker: 0 }],
+    [], speakers,
+    { tracker, pendingSpeakerClusters: new Set(["0"]) }
+  );
+  assert.equal(segment.speaker, "미등록 화자 A");
+  assert.equal(tracker.hasEvidence("0"), true);
+});
+
 test("reuses a stable cluster identity when a later word has no overlapping frame", () => {
   const tracker = new SpeakerIdentityTracker();
   const frames = [{ start: 0, end: 2, scores: [0.9, 0.2] }];

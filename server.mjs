@@ -7,10 +7,11 @@ import express from "express";
 import multer from "multer";
 import WebSocket, { WebSocketServer } from "ws";
 import { AuthError, AuthStore } from "./lib/auth-store.mjs";
-import { analyzePcmQuality, isSpeakerInferenceQuality } from "./lib/audio-quality.mjs";
+import { analyzePcmQuality, isSpeakerInferenceQuality, isSpeakerSignalQuality } from "./lib/audio-quality.mjs";
 import { normalizeTranscript } from "./lib/normalize-transcript.mjs";
 import { assessNewSpeakerSeparation, assessSpeakerProfileExtension, getSpeakerEmbeddingModel, mergeSpeakerProfileVectors, speakerInferenceInfo, speakerModelInfo } from "./lib/speaker-embedding-model.mjs";
 import { diarizedAudioRegions, speakerDecision, SpeakerIdentityTracker, wordsToSegments, wordsToTranscriptSegments } from "./lib/speaker-matching.mjs";
+import { SpeakerAudioAccumulator } from "./lib/speaker-audio-accumulator.mjs";
 import { SpeakerStore } from "./lib/speaker-store.mjs";
 import { MeetingStore } from "./lib/meeting-store.mjs";
 import { reconcileTranscriptSpeakers } from "./lib/reconcile-speakers.mjs";
@@ -1233,10 +1234,12 @@ liveServer.on("connection", async (client, request, requestUrl) => {
     const identityTracker = mode === "speaker" ? new SpeakerIdentityTracker() : null;
     const recognitionFrames = [];
     const analyzedRegions = new Set();
+    const pendingSpeakerClusters = new Set();
     const audioHistory = new PcmHistoryBuffer(speakerModelInfo.sampleRate * 90);
+    const speakerAudioAccumulator = new SpeakerAudioAccumulator({ sampleRate: speakerModelInfo.sampleRate });
 
     const analyzeDiarizedRegions = async (words) => {
-      for (const region of diarizedAudioRegions(words)) {
+      for (const region of diarizedAudioRegions(words, { minimumDuration: 0.2 })) {
         const cacheKey = `${region.sourceSpeaker}:${region.start.toFixed(2)}:${region.end.toFixed(2)}`;
         if (analyzedRegions.has(cacheKey)) continue;
         const firstSample = Math.max(audioHistory.earliestSample, Math.floor(region.start * speakerModelInfo.sampleRate));
@@ -1245,19 +1248,27 @@ liveServer.on("connection", async (client, request, requestUrl) => {
         const snapshot = audioHistory.slice(firstSample, lastSample);
         try {
           const pcm = new Int16Array(snapshot.buffer, snapshot.byteOffset, snapshot.byteLength / 2);
-          const inferenceQuality = analyzePcmQuality(pcm, speakerModelInfo.sampleRate);
+          const chunkQuality = analyzePcmQuality(pcm, speakerModelInfo.sampleRate);
+          if (!isSpeakerSignalQuality(chunkQuality)) continue;
+          analyzedRegions.add(cacheKey);
+          const accumulated = speakerAudioAccumulator.add(region.sourceSpeaker, pcm, region);
+          if (!accumulated) {
+            if (!identityTracker.hasEvidence(region.sourceSpeaker)) pendingSpeakerClusters.add(region.sourceSpeaker);
+            continue;
+          }
+          const inferenceQuality = analyzePcmQuality(accumulated.pcm, speakerModelInfo.sampleRate);
           if (!isSpeakerInferenceQuality(inferenceQuality)) continue;
-          const scores = await speakerModel.compare(pcm, profiles);
+          const scores = await speakerModel.compare(accumulated.pcm, profiles);
           if (scores) {
+            pendingSpeakerClusters.delete(region.sourceSpeaker);
             recognitionFrames.push({
               start: region.start,
               end: region.end,
               sourceSpeaker: region.sourceSpeaker,
-              weight: Math.min(8, region.end - region.start) * Math.max(0.5, Math.min(1, inferenceQuality.snrDb / 20)),
+              weight: Math.min(8, accumulated.newEvidenceSeconds) * Math.max(0.5, Math.min(1, inferenceQuality.snrDb / 20)),
               qualityScore: inferenceQuality.score,
               scores
             });
-            analyzedRegions.add(cacheKey);
           }
         } catch (error) {
           console.error("Diarized speaker inference failed:", error);
@@ -1320,7 +1331,8 @@ liveServer.on("connection", async (client, request, requestUrl) => {
             ? wordsToSegments(alternative.words, recognitionFrames, speakers, {
               threshold: Number(process.env.SPEAKER_MATCH_THRESHOLD) || 0.72,
               margin: Number(process.env.SPEAKER_MATCH_MARGIN) || 0.04,
-              tracker: identityTracker
+              tracker: identityTracker,
+              pendingSpeakerClusters
             })
             : wordsToTranscriptSegments(alternative.words);
           if (client.readyState === WebSocket.OPEN) {
