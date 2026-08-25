@@ -25,6 +25,14 @@ test("persists and isolates organization meetings", async () => {
   assert.equal(updated.segments[0].transcriptCorrected, true);
   assert.equal(updated.segments[0].confidence, null);
   assert.equal(updated.segments[0].transcriptConfidence, 0.84);
+  const staleAutosave = await store.update(meeting.id, "org-a", {
+    status: "recording",
+    duration: 1,
+    segments: [{ speaker: "민수", start: 0, end: 1, text: "오래된 자동 저장" }]
+  });
+  assert.equal(staleAutosave.status, "completed");
+  assert.equal(staleAutosave.duration, 3.4);
+  assert.equal(staleAutosave.segments[0].text, "실제 회의를 저장합니다.");
   assert.equal((await store.list("org-a")).length, 1);
   assert.equal((await store.list("org-b")).length, 0);
   assert.equal(await store.get(meeting.id, "org-b"), null);
