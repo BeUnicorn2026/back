@@ -178,7 +178,7 @@ test("disabled recognition keeps room STT running without loading the speaker mo
       room: { id: "room-a" },
       meeting: { id: "meeting-a" },
       canonicalProfile: {
-        id: "profile-owner", speakerProfileId: "profile-owner", createdBy: "user-owner",
+        id: null, speakerProfileId: null, createdBy: "user-owner",
         userId: "user-owner", name: "Owner", displayName: "Owner", profiles: []
       },
       meetingStore: {
@@ -192,8 +192,7 @@ test("disabled recognition keeps room STT running without loading the speaker mo
         assert.fail("speaker model must stay disabled");
       },
       speakerRecognitionEnabled: false,
-      speakerModelInfo: { sampleRate: 16_000, defaultMatchThreshold: 0.72, defaultMatchMargin: 0.04 },
-      speakerInferenceInfo: { windowSeconds: 1, realtimeMaximumEmbeddings: 3 },
+      sampleRate: 8_000,
       deepgramApiKey: "test-only-placeholder",
       hubConnection: {
         async acceptFinalSegment(segment, persist) { return persist(segment); },
@@ -239,11 +238,76 @@ test("disabled recognition keeps room STT running without loading the speaker mo
       text: "모델 없이 받아쓰기",
       transcriptConfidence: 0.98,
       userId: "user-owner",
-      speakerProfileId: "profile-owner",
+      speakerProfileId: null,
       displayName: "Owner",
       sequence: 0
     });
+    assert.equal((await waitForMessage(client, "ready")).sampleRate, 8_000);
+    assert.match(providerUrl, /sample_rate=8000/);
     assert.doesNotMatch(providerUrl, /diarize=true/);
+  } finally {
+    client.close();
+    if (provider.readyState !== WebSocket.CLOSED) provider.close();
+  }
+});
+
+test("disabled recognition persists distinct finals sharing a request_id but suppresses exact replay", async () => {
+  const client = new FakeSocket();
+  const provider = new FakeSocket();
+  const persisted = [];
+
+  const emitFinal = (words) => provider.emit("message", JSON.stringify({
+    type: "Results",
+    is_final: true,
+    metadata: { request_id: "shared-final" },
+    channel: { alternatives: [{ words }] }
+  }));
+
+  try {
+    await handleSelfOnlyRoomLive({
+      client,
+      requestUrl: new URL("http://localhost/api/live?roomId=room-a"),
+      auth: { user: { id: "user-owner", name: "Owner" }, organization: { id: "org-a" } },
+      room: { id: "room-a" },
+      meeting: { id: "meeting-a" },
+      canonicalProfile: {
+        id: null, speakerProfileId: null, createdBy: "user-owner",
+        userId: "user-owner", name: "Owner", displayName: "Owner", profiles: []
+      },
+      meetingStore: {
+        async appendAcceptedSegment(_meetingId, _organizationId, segment) {
+          const accepted = { ...segment, sequence: persisted.length };
+          persisted.push(accepted);
+          return accepted;
+        }
+      },
+      async prepareSpeakerModel() {
+        assert.fail("speaker model must stay disabled");
+      },
+      speakerRecognitionEnabled: false,
+      deepgramApiKey: "test-only-placeholder",
+      hubConnection: {
+        async acceptFinalSegment(segment, persist) { return persist(segment); },
+        async release() {}
+      },
+      createProvider() { return provider; }
+    });
+
+    provider.emit("open");
+    // Two distinct utterances that reuse the same provider request_id.
+    emitFinal([{ word: "첫 번째 문장", start: 0, end: 1, confidence: 0.98 }]);
+    emitFinal([{ word: "두 번째 문장", start: 2, end: 3, confidence: 0.97 }]);
+    // Exact replay of the first final must be suppressed.
+    emitFinal([{ word: "첫 번째 문장", start: 0, end: 1, confidence: 0.98 }]);
+
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(persisted.length, 2);
+    assert.deepEqual(persisted.map(({ text, start, end }) => ({ text, start, end })), [
+      { text: "첫 번째 문장", start: 0, end: 1 },
+      { text: "두 번째 문장", start: 2, end: 3 }
+    ]);
   } finally {
     client.close();
     if (provider.readyState !== WebSocket.CLOSED) provider.close();

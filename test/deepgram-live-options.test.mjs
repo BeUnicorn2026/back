@@ -24,3 +24,19 @@ test("keeps plain STT free of diarization and unsupported numeral formatting", (
   assert.equal(query.has("diarize_model"), false);
   assert.equal(query.has("numerals"), false);
 });
+
+test("defaults the provider sample rate to 16000 when unspecified", () => {
+  const query = buildDeepgramLiveQuery({ language: "ko", mode: "stt" });
+  assert.equal(query.get("sample_rate"), "16000");
+});
+
+test("propagates a non-default sample rate into the provider query", () => {
+  const query = buildDeepgramLiveQuery({ language: "ko", mode: "stt", sampleRate: 8_000 });
+  assert.equal(query.get("sample_rate"), "8000");
+});
+
+test("falls back to 16000 for a non-positive or non-finite sample rate", () => {
+  assert.equal(buildDeepgramLiveQuery({ sampleRate: 0 }).get("sample_rate"), "16000");
+  assert.equal(buildDeepgramLiveQuery({ sampleRate: -1 }).get("sample_rate"), "16000");
+  assert.equal(buildDeepgramLiveQuery({ sampleRate: Number.NaN }).get("sample_rate"), "16000");
+});
