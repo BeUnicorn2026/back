@@ -984,27 +984,31 @@ app.post("/api/speakers/identify", requireTrustedOrigin, requireAuth, requireOrg
         ambiguous: "둘 이상의 등록 목소리와 비슷해 안전하게 이름을 확정하지 않았습니다.",
         invalid_scores: "화자 비교 결과를 계산하지 못했습니다."
       };
-      let verification = { recorded: false, reason: decision.accepted ? "needs_new_enrollment" : "not_matched" };
+      const expectedSpeakerId = String(request.body?.expectedSpeakerId || "").trim();
+      const expectedSpeaker = expectedSpeakerId ? speakers.find(({ id }) => id === expectedSpeakerId) : null;
+      if (expectedSpeakerId && !expectedSpeaker) return response.status(400).json({ error: "검증 대상 화자를 찾지 못했습니다." });
+      const verification = speakerVerificationUpdate(expectedSpeaker, {
+        fingerprint: speakerProbeFingerprint(samples),
+        score: decision.bestScore,
+        qualityScore: quality.score,
+        independentRecording: request.body?.independentRecording === "true",
+        expectedSpeakerId,
+        predictedSpeakerId: decision.identity?.id || ""
+      });
       let speakerProfile = null;
-      if (decision.accepted && decision.identity) {
-        const matchedSpeaker = speakers.find(({ id }) => id === decision.identity.id);
-        verification = speakerVerificationUpdate(matchedSpeaker, {
-          fingerprint: speakerProbeFingerprint(samples),
-          score: decision.bestScore,
-          qualityScore: quality.score,
-          independentRecording: request.body?.independentRecording === "true"
-        });
-        if (verification.recorded) {
-          speakerProfile = publicSpeakerProfile(await speakerStore.updateMetadata(
-            matchedSpeaker.id,
-            request.auth.organization.id,
-            verification.changes
-          ));
-        }
+      if (verification.recorded) {
+        speakerProfile = publicSpeakerProfile(await speakerStore.updateMetadata(
+          expectedSpeaker.id,
+          request.auth.organization.id,
+          verification.changes
+        ));
       }
       const verificationMessages = {
         independent_probe: "등록과 다른 음성으로 실사용 검증을 기록했습니다.",
         not_confirmed: "식별 결과만 확인했습니다. 별도 녹음 확인을 선택하지 않아 검증 횟수에는 반영하지 않았습니다.",
+        expected_not_selected: "실제 화자를 선택하지 않아 검증 횟수에는 반영하지 않았습니다.",
+        expected_not_matched: "선택한 실제 화자를 모델이 확정하지 못해 성공 검증으로 기록하지 않았습니다.",
+        unexpected_identity: "모델 판정과 선택한 실제 화자가 달라 성공 검증으로 기록하지 않았습니다.",
         enrollment_audio: "등록에 사용한 동일 음성이라 별도 환경 검증에는 반영하지 않았습니다.",
         duplicate_probe: "이미 검증한 동일 음성이라 검증 횟수를 늘리지 않았습니다.",
         needs_new_enrollment: "기존 프로필에는 등록 파일 지문이 없어 새 샘플을 추가한 뒤 별도 음성으로 다시 검증해 주세요.",

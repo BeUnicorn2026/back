@@ -11,7 +11,7 @@ test("fingerprints canonical PCM and records only an independent probe once", ()
 
   const first = speakerVerificationUpdate({ enrollmentFingerprints: [enrollmentFingerprint] }, {
     fingerprint: probeFingerprint, score: 0.81, qualityScore: 88, verifiedAt: "2026-08-24T00:00:00.000Z",
-    independentRecording: true
+    independentRecording: true, expectedSpeakerId: "speaker-a", predictedSpeakerId: "speaker-a"
   });
   assert.equal(first.recorded, true);
   assert.equal(first.changes.crossSessionVerificationCount, 1);
@@ -21,7 +21,7 @@ test("fingerprints canonical PCM and records only an independent probe once", ()
     enrollmentFingerprints: [enrollmentFingerprint],
     verificationFingerprints: first.changes.verificationFingerprints,
     crossSessionVerificationCount: 1
-  }, { fingerprint: probeFingerprint, score: 0.9, independentRecording: true });
+  }, { fingerprint: probeFingerprint, score: 0.9, independentRecording: true, expectedSpeakerId: "speaker-a", predictedSpeakerId: "speaker-a" });
   assert.equal(duplicate.recorded, false);
   assert.equal(duplicate.reason, "duplicate_probe");
 });
@@ -29,6 +29,16 @@ test("fingerprints canonical PCM and records only an independent probe once", ()
 test("does not treat enrollment audio or legacy profiles as independent verification", () => {
   const fingerprint = speakerProbeFingerprint(new Int16Array([1, 2, 3]));
   assert.equal(speakerVerificationUpdate({ enrollmentFingerprints: [fingerprint] }, { fingerprint }).reason, "not_confirmed");
-  assert.equal(speakerVerificationUpdate({ enrollmentFingerprints: [fingerprint] }, { fingerprint, independentRecording: true }).reason, "enrollment_audio");
-  assert.equal(speakerVerificationUpdate({}, { fingerprint, independentRecording: true }).reason, "needs_new_enrollment");
+  const identity = { independentRecording: true, expectedSpeakerId: "speaker-a", predictedSpeakerId: "speaker-a" };
+  assert.equal(speakerVerificationUpdate({ enrollmentFingerprints: [fingerprint] }, { fingerprint, ...identity }).reason, "enrollment_audio");
+  assert.equal(speakerVerificationUpdate({}, { fingerprint, ...identity }).reason, "needs_new_enrollment");
+});
+
+test("requires the declared speaker to match the model decision", () => {
+  const evidence = { fingerprint: "probe", independentRecording: true };
+  assert.equal(speakerVerificationUpdate({}, evidence).reason, "expected_not_selected");
+  assert.equal(speakerVerificationUpdate({}, { ...evidence, expectedSpeakerId: "speaker-a" }).reason, "expected_not_matched");
+  assert.equal(speakerVerificationUpdate({}, {
+    ...evidence, expectedSpeakerId: "speaker-a", predictedSpeakerId: "speaker-b"
+  }).reason, "unexpected_identity");
 });
