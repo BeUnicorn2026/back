@@ -24,6 +24,7 @@ type Job struct {
 	ID        string          `json:"id"`
 	Status    Status          `json:"status"`
 	MeetingID string          `json:"meetingId,omitempty"`
+	TenantKey string          `json:"-"`
 	Result    *meetmap.Result `json:"result,omitempty"`
 	Error     string          `json:"error,omitempty"`
 	CreatedAt time.Time       `json:"createdAt"`
@@ -56,7 +57,7 @@ func (manager *Manager) Submit(request meetmap.Request) (Job, error) {
 		return Job{}, err
 	}
 	now := time.Now().UTC()
-	job := &Job{ID: newID(), Status: Queued, MeetingID: request.MeetingID, CreatedAt: now, UpdatedAt: now, segments: segments}
+	job := &Job{ID: newID(), Status: Queued, MeetingID: request.MeetingID, TenantKey: request.TenantKey, CreatedAt: now, UpdatedAt: now, segments: segments}
 	manager.mu.Lock()
 	manager.jobs[job.ID] = job
 	submitted := public(*job)
@@ -72,11 +73,11 @@ func (manager *Manager) Submit(request meetmap.Request) (Job, error) {
 	}
 }
 
-func (manager *Manager) Get(id string) (Job, bool) {
+func (manager *Manager) Get(id, tenantKey string) (Job, bool) {
 	manager.mu.RLock()
 	defer manager.mu.RUnlock()
 	job, ok := manager.jobs[id]
-	if !ok {
+	if !ok || job.TenantKey != tenantKey {
 		return Job{}, false
 	}
 	return public(*job), true

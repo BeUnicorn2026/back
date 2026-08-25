@@ -1,6 +1,8 @@
 services:
   voice-partition:
-    build: .
+    build:
+      context: .
+      target: node-runtime
     image: voice-partition-back:local
     init: true
     restart: unless-stopped
@@ -18,12 +20,35 @@ services:
       VOICE_PARTITION_DATA_DIR: /app/.data
       SPEAKER_MODEL_CACHE: /app/.cache/speaker-models
       PRELOAD_SPEAKER_MODEL: "true"
+      GO_AI_ORIGIN: http://voice-partition-ai:7071
+      AI_API_TOKEN: ${AI_API_TOKEN:?AI_API_TOKEN is required}
     volumes:
       - voice-partition-data:/app/.data
       - voice-partition-speaker-models:/app/.cache/speaker-models
     tmpfs:
       - /tmp:size=256m,mode=1777
     stop_grace_period: 15s
+    depends_on:
+      voice-partition-ai:
+        condition: service_healthy
+    networks:
+      - voice-partition
+
+  voice-partition-ai:
+    build:
+      context: .
+      target: go-runtime
+    image: voice-partition-ai:local
+    restart: unless-stopped
+    mem_limit: 512m
+    pids_limit: 128
+    env_file:
+      - ${BACKEND_ENV_FILE:-.env}
+    environment:
+      GO_HOST: 0.0.0.0
+      GO_PORT: 7071
+      AI_API_TOKEN: ${AI_API_TOKEN:?AI_API_TOKEN is required}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-stealth/ox-alpha}
     networks:
       - voice-partition
 

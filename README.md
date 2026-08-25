@@ -2,7 +2,7 @@
 
 ## Go migration server
 
-The Go server currently owns the asynchronous MeetMap pipeline while the existing Node server remains the compatibility runtime for auth, billing, STT, WebSocket audio, and persistence.
+The Go server owns the asynchronous MeetMap pipeline while the existing Node server remains the public compatibility runtime for auth, billing, STT, WebSocket audio, and persistence. In Compose, Node forwards authenticated MeetMap requests to the private Go service.
 
 ```bash
 cp .env.example .env
@@ -14,6 +14,7 @@ AI_API_TOKEN=local-development-token npm run go:dev
 ```bash
 curl -X POST http://127.0.0.1:7071/api/ai/meetmap/jobs \
   -H 'Authorization: Bearer local-development-token' \
+  -H 'X-Voice-Partition-Tenant: local:developer' \
   -H 'Content-Type: application/json' \
   -d '{"meetingId":"demo","segments":[{"speaker":"민수","start":0,"end":2,"text":"어떻게 시작할까요?"}]}'
 ```

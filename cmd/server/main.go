@@ -26,7 +26,7 @@ func main() {
 	analyzer := meetmap.NewOpenRouter(cfg.OpenRouterAPIKey, cfg.OpenRouterBaseURL, cfg.OpenRouterModel, cfg.PublicOrigin, cfg.OpenRouterTimeout)
 	manager := jobs.New(analyzer, cfg.WorkerCount, cfg.QueueSize)
 	defer manager.Close()
-	httpServer := httpapi.HTTPServer(fmt.Sprintf("127.0.0.1:%d", cfg.Port), httpapi.New(cfg, manager))
+	httpServer := httpapi.HTTPServer(fmt.Sprintf("%s:%d", cfg.Host, cfg.Port), httpapi.New(cfg, manager))
 	go func() {
 		slog.Info("Go migration API listening", "address", httpServer.Addr, "model", cfg.OpenRouterModel, "openrouter", cfg.OpenRouterAPIKey != "")
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

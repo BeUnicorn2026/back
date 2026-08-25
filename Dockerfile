@@ -1,4 +1,26 @@
-FROM node:24-bookworm-slim
+FROM golang:1.26-bookworm AS go-builder
+
+WORKDIR /src
+COPY go.mod ./
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/voice-partition-go ./cmd/server
+
+FROM debian:bookworm-slim AS go-runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=go-builder /out/voice-partition-go /usr/local/bin/voice-partition-go
+
+USER nobody
+EXPOSE 7071
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+  CMD curl --fail --silent http://127.0.0.1:7071/api/health/ready >/dev/null || exit 1
+CMD ["voice-partition-go"]
+
+FROM node:24-bookworm-slim AS node-runtime
 
 ENV NODE_ENV=production \
     PORT=7070 \

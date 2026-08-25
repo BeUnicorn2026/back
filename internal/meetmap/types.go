@@ -16,6 +16,7 @@ type Segment struct {
 type Request struct {
 	MeetingID string    `json:"meetingId,omitempty"`
 	Segments  []Segment `json:"segments"`
+	TenantKey string    `json:"-"`
 }
 
 type Node struct {

@@ -11,6 +11,7 @@ import (
 const DefaultOpenRouterModel = "stealth/ox-alpha"
 
 type Config struct {
+	Host              string
 	Port              int
 	PublicOrigin      string
 	OpenRouterAPIKey  string
@@ -25,6 +26,7 @@ type Config struct {
 
 func Load() (Config, error) {
 	cfg := Config{
+		Host:              value("GO_HOST", "127.0.0.1"),
 		Port:              integer("GO_PORT", 7071),
 		PublicOrigin:      strings.TrimSpace(os.Getenv("PUBLIC_ORIGIN")),
 		OpenRouterAPIKey:  strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY")),

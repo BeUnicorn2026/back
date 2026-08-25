@@ -48,6 +48,7 @@ import { PostgresBillingStore } from "./lib/postgres-billing-store.mjs";
 import { publicBillingPlans } from "./lib/billing-plans.mjs";
 import { TossPaymentsClient, TossPaymentsError } from "./lib/toss-payments-client.mjs";
 import { entitlementPeriodStart, meetingAllowance, planEntitlements } from "./lib/plan-entitlements.mjs";
+import { GoMeetMapClient } from "./lib/go-meetmap-client.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 7070;
@@ -108,6 +109,10 @@ emailService.assertConfigured();
 const meetingIntelligenceService = new MeetingIntelligenceService({
   apiKey: process.env.OPENAI_API_KEY,
   model: process.env.OPENAI_ANALYSIS_MODEL
+});
+const goMeetMapClient = new GoMeetMapClient({
+  origin: process.env.GO_AI_ORIGIN,
+  token: process.env.AI_API_TOKEN
 });
 const knowledgeExplanationService = new KnowledgeExplanationService({
   apiKey: process.env.OPENAI_API_KEY,
@@ -217,6 +222,8 @@ const verificationRateLimit = rateLimit("email-verification", { limit: 10, windo
 const verificationResendRateLimit = rateLimit("email-verification-resend", { limit: 3, windowMs: 15 * 60_000 }, (request) =>
   `${request.ip}:${String(request.body?.email || "").trim().toLocaleLowerCase()}`);
 const meetingAnalysisRateLimit = rateLimit("meeting-analysis", { limit: 12, windowMs: 60 * 60_000 }, (request) =>
+  `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
+const liveMeetMapRateLimit = rateLimit("live-meetmap", { limit: 120, windowMs: 60 * 60_000 }, (request) =>
   `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
 const speakerEnrollmentRateLimit = rateLimit("speaker-enrollment", { limit: 12, windowMs: 60 * 60_000 }, (request) =>
   `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
@@ -1020,6 +1027,31 @@ app.get("/api/meetings/:id", requireAuth, requireOrganization, async (request, r
   const meeting = await meetingStore.get(request.params.id, request.auth.organization.id);
   if (!meeting) return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
   response.json({ meeting });
+});
+
+app.post("/api/meetmap/jobs", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
+  liveMeetMapRateLimit, async (request, response) => {
+    const tenantKey = `${request.auth.organization.id}:${request.auth.user.id}`;
+    try {
+      const result = await goMeetMapClient.submit({
+        meetingId: typeof request.body?.meetingId === "string" ? request.body.meetingId : "",
+        segments: Array.isArray(request.body?.segments) ? request.body.segments : [],
+        tenantKey
+      });
+      return response.status(202).json(result);
+    } catch (error) {
+      console.error("Go MeetMap submission failed:", error);
+      return response.status(Number(error?.status) || 502).json({ error: error.message || "대화 구조 분석을 시작하지 못했습니다." });
+    }
+  });
+
+app.get("/api/meetmap/jobs/:id", requireAuth, requireOrganization, async (request, response) => {
+  const tenantKey = `${request.auth.organization.id}:${request.auth.user.id}`;
+  try {
+    return response.json(await goMeetMapClient.get(request.params.id, tenantKey));
+  } catch (error) {
+    return response.status(Number(error?.status) || 502).json({ error: error.message || "대화 구조 분석 상태를 확인하지 못했습니다." });
+  }
 });
 
 app.post("/api/meetings", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {

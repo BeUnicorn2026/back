@@ -37,7 +37,7 @@ func (server *Server) middleware(next http.Handler) http.Handler {
 		response.Header().Set("Referrer-Policy", "no-referrer")
 		if server.config.PublicOrigin != "" && request.Header.Get("Origin") == server.config.PublicOrigin {
 			response.Header().Set("Access-Control-Allow-Origin", server.config.PublicOrigin)
-			response.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			response.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Voice-Partition-Tenant")
 			response.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			response.Header().Set("Vary", "Origin")
 		}
@@ -82,6 +82,11 @@ func (server *Server) health(response http.ResponseWriter, _ *http.Request) {
 }
 
 func (server *Server) createMeetMapJob(response http.ResponseWriter, request *http.Request) {
+	tenantKey := strings.TrimSpace(request.Header.Get("X-Voice-Partition-Tenant"))
+	if tenantKey == "" {
+		writeError(response, http.StatusBadRequest, "분석 작업 소유자 정보가 필요합니다")
+		return
+	}
 	request.Body = http.MaxBytesReader(response, request.Body, server.config.MaximumBodyBytes)
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
@@ -99,6 +104,7 @@ func (server *Server) createMeetMapJob(response http.ResponseWriter, request *ht
 		writeError(response, http.StatusBadRequest, "요청 본문에는 JSON 객체 하나만 허용됩니다")
 		return
 	}
+	input.TenantKey = tenantKey
 	job, err := server.jobs.Submit(input)
 	if err != nil {
 		status := http.StatusBadRequest
@@ -113,7 +119,7 @@ func (server *Server) createMeetMapJob(response http.ResponseWriter, request *ht
 }
 
 func (server *Server) getMeetMapJob(response http.ResponseWriter, request *http.Request) {
-	job, ok := server.jobs.Get(request.PathValue("id"))
+	job, ok := server.jobs.Get(request.PathValue("id"), strings.TrimSpace(request.Header.Get("X-Voice-Partition-Tenant")))
 	if !ok {
 		writeError(response, http.StatusNotFound, "분석 작업을 찾지 못했습니다")
 		return

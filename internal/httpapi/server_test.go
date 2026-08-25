@@ -22,6 +22,7 @@ func TestMeetMapJobRunsAsynchronously(t *testing.T) {
 	body := `{"meetingId":"meeting-1","segments":[{"speaker":"민수","start":0,"end":2,"text":"어떻게 시작할까요?"},{"speaker":"지수","start":3,"end":5,"text":"작게 시작하는 입장입니다"}]}`
 	request := httptest.NewRequest(http.MethodPost, "/api/ai/meetmap/jobs", bytes.NewBufferString(body))
 	request.Header.Set("Authorization", "Bearer secret")
+	request.Header.Set("X-Voice-Partition-Tenant", "org-1:user-1")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusAccepted {
@@ -37,6 +38,7 @@ func TestMeetMapJobRunsAsynchronously(t *testing.T) {
 	for time.Now().Before(deadline) {
 		lookup := httptest.NewRequest(http.MethodGet, "/api/ai/meetmap/jobs/"+created.Job.ID, nil)
 		lookup.Header.Set("Authorization", "Bearer secret")
+		lookup.Header.Set("X-Voice-Partition-Tenant", "org-1:user-1")
 		result := httptest.NewRecorder()
 		handler.ServeHTTP(result, lookup)
 		var payload struct {

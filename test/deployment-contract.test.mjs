@@ -10,6 +10,9 @@ test("production compose keeps the API private behind a restarting tunnel", asyn
   assert.match(compose, /restart:\s*unless-stopped/g);
   assert.match(compose, /CLOUDFLARE_TUNNEL_TOKEN/);
   assert.match(compose, /condition:\s*service_healthy/);
+  assert.match(compose, /voice-partition-ai:[\s\S]*target:\s*go-runtime/);
+  assert.match(compose, /OPENROUTER_MODEL:\s*\$\{OPENROUTER_MODEL:-stealth\/ox-alpha\}/);
+  assert.match(compose, /GO_AI_ORIGIN:\s*http:\/\/voice-partition-ai:7071/);
 });
 
 test("updater only applies clean fast-forward changes", async () => {
