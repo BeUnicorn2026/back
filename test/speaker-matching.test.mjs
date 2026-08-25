@@ -219,7 +219,9 @@ test("selects dense full-length speech windows without increasing real-time infe
   for (let index = 4 * 16_000; index < 7 * 16_000; index += 1) {
     pcm[index] = Math.round(Math.sin(index / 13) * 4_000);
   }
-  const [best] = speakerInferenceWindows(pcm);
+  const defaultWindows = speakerInferenceWindows(pcm);
+  assert.equal(defaultWindows.length, 1);
+  const [best] = defaultWindows;
   assert.equal(best.length, 3 * 16_000);
   assert.ok(pcmRms(best) > pcmRms(pcm));
   const diverse = speakerInferenceWindows(pcm, { maximumEmbeddings: 3 });

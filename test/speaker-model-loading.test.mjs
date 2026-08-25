@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { getSpeakerEmbeddingModel, SpeakerEmbeddingModel } from "../lib/speaker-embedding-model.mjs";
+import { getSpeakerEmbeddingModel, speakerInferenceInfo, speakerInferenceWindows, SpeakerEmbeddingModel } from "../lib/speaker-embedding-model.mjs";
 
 test("retries speaker model initialization after a failure instead of caching rejection", async () => {
   const first = getSpeakerEmbeddingModel("/unused", "/definitely-missing/speaker-model-one.onnx");
@@ -26,4 +26,17 @@ test("runs inference for clean speech below the stricter enrollment volume", asy
   const scores = await model.compare(pcm, [[new Float32Array([1, 0])]]);
   assert.equal(inferenceCalls, 1);
   assert.ok(scores[0] > 0.99);
+});
+
+test("uses two separated high-quality windows for accumulated real-time speaker evidence", () => {
+  const pcm = new Int16Array(6 * 16_000);
+  for (let index = 0; index < pcm.length; index += 1) {
+    pcm[index] = Math.round(Math.sin(index / 11) * 4_000);
+  }
+  const windows = speakerInferenceWindows(pcm, {
+    maximumEmbeddings: speakerInferenceInfo.realtimeMaximumEmbeddings
+  });
+  assert.equal(speakerInferenceInfo.realtimeMaximumEmbeddings, 2);
+  assert.equal(windows.length, 2);
+  assert.notEqual(windows[0].byteOffset, windows[1].byteOffset);
 });

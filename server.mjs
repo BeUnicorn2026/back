@@ -40,6 +40,7 @@ import { speakerRegionSampleRange } from "./lib/live-speaker-regions.mjs";
 import { isSupportedAudioUpload } from "./lib/audio-upload.mjs";
 import { selectSpeakerReferencePcm } from "./lib/speaker-reference.mjs";
 import { canForwardLiveAudio } from "./lib/live-audio-backpressure.mjs";
+import { buildDeepgramLiveQuery } from "./lib/deepgram-live-options.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 3001;
@@ -1310,7 +1311,9 @@ liveServer.on("connection", async (client, request, requestUrl) => {
           }
           const inferenceQuality = analyzePcmQuality(accumulated.pcm, speakerModelInfo.sampleRate);
           if (!isSpeakerInferenceQuality(inferenceQuality)) continue;
-          const scores = await speakerModel.compare(accumulated.pcm, profiles);
+          const scores = await speakerModel.compare(accumulated.pcm, profiles, {
+            maximumEmbeddings: speakerInferenceInfo.realtimeMaximumEmbeddings
+          });
           if (scores) {
             pendingSpeakerClusters.delete(region.sourceSpeaker);
             recognitionFrames.push({
@@ -1328,20 +1331,15 @@ liveServer.on("connection", async (client, request, requestUrl) => {
       }
     };
 
-    const languageMap = { ko: "ko-KR", en: "en-US", ja: "ja" };
-    const language = languageMap[requestUrl.searchParams.get("language")] || "ko-KR";
-    const query = new URLSearchParams({
-      model: "nova-3", language, encoding: "linear16", sample_rate: "16000", channels: "1",
-      interim_results: "true", endpointing: "300", punctuate: "true", smart_format: "true"
-    });
-    if (mode === "speaker") query.set("diarize_model", "latest");
     const organizationTerms = await meetingStore.listVocabularyTerms(auth.organization.id, auth.user.vocabulary?.knownTerms || []);
     const keyterms = buildSttKeyterms({
       knownTerms: auth.user.vocabulary?.knownTerms || [],
       organizationTerms,
       speakerNames: speakers.map(({ name }) => name)
     });
-    for (const keyterm of keyterms) query.append("keyterm", keyterm);
+    const query = buildDeepgramLiveQuery({
+      language: requestUrl.searchParams.get("language"), mode, keyterms
+    });
     deepgram = new WebSocket(`wss://api.deepgram.com/v1/listen?${query}`, {
       headers: { Authorization: `Token ${process.env.DEEPGRAM_API_KEY}` }
     });
@@ -1363,6 +1361,18 @@ liveServer.on("connection", async (client, request, requestUrl) => {
     };
     deepgram.on("message", (raw) => {
       const event = JSON.parse(raw.toString());
+      if (event.type === "SpeechStarted") {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({ type: "speech_started", timestamp: Number(event.timestamp) || 0 }));
+        }
+        return;
+      }
+      if (event.type === "UtteranceEnd") {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({ type: "utterance_end", lastWordEnd: Number(event.last_word_end) || 0 }));
+        }
+        return;
+      }
       if (event.type !== "Results") return;
       const alternative = event.channel?.alternatives?.[0];
       if (alternative?.words?.length) {
