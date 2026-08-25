@@ -480,7 +480,7 @@ function publicSpeakerProfile(speaker) {
 async function personalizedTermsFor(user, terms) {
   const knownTerms = user.vocabulary?.knownTerms || [];
   const states = await knowledgeStore.statesForTerms(user.id, terms.map(({ term }) => term), knownTerms);
-  return personalizeKnowledgeTerms(terms, states, user.vocabulary?.roles || []);
+  return personalizeKnowledgeTerms(terms, states);
 }
 
 async function personalizedIntelligenceFor(user, intelligence) {
@@ -495,6 +495,7 @@ function publicKnowledgeExplanation(stored) {
     term: stored.term,
     level: stored.level,
     explanation: stored.result.explanation,
+    originalSentence: stored.result.originalSentence || "",
     rewrittenContext: stored.result.rewrittenContext || "",
     analogy: stored.result.analogy,
     checkQuestion: stored.result.checkQuestion,

@@ -58,10 +58,16 @@ test("caches generated explanations privately and removes them with the concept"
   await store.recordEvidence({ userId: "user-a", conceptLabel: "임베딩", kind: "card_open", eventId: "open-cache" });
   const saved = await store.saveExplanation({
     userId: "user-a", cacheKey, conceptLabel: "임베딩", level: "simple",
-    result: { explanation: "쉬운 설명", correctChoiceIndex: 1 }, source: "openai", model: "test-model",
-    meetingId: "meeting-a", segmentIndex: 2
+    result: {
+      explanation: "쉬운 설명", correctChoiceIndex: 1,
+      originalSentence: "이번 회의에서 임베딩을 도입하기로 했다.",
+      rewrittenContext: "이번 회의에서 의미를 숫자로 바꾼 값을 도입하기로 했다."
+    },
+    source: "openai", model: "test-model", meetingId: "meeting-a", segmentIndex: 2
   });
   assert.equal(saved.result.correctChoiceIndex, 1);
+  assert.equal(saved.result.originalSentence, "이번 회의에서 임베딩을 도입하기로 했다.");
+  assert.equal(saved.result.rewrittenContext, "이번 회의에서 의미를 숫자로 바꾼 값을 도입하기로 했다.");
   assert.equal(saved.segmentIndex, 2);
   assert.equal(await store.getExplanation("user-b", cacheKey), null);
   assert.equal((await store.getExplanation("user-a", cacheKey)).term, "임베딩");
