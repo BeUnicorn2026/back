@@ -34,8 +34,9 @@ import { KnowledgeExplanationService, knowledgeExplanationCacheKey } from "./lib
 import { normalizeUploadFilename, uploadTitle } from "./lib/upload-filename.mjs";
 import { productionEnvironmentIssues, serviceReadiness } from "./lib/service-readiness.mjs";
 import { createConcurrencyLimit } from "./lib/concurrency-limit.mjs";
-import { recordingEnvelopeSimilarity, speakerProbeFingerprint, speakerVerificationUpdate } from "./lib/speaker-verification.mjs";
+import { expectedSpeakerScore, recordingEnvelopeSimilarity, speakerProbeFingerprint, speakerVerificationUpdate } from "./lib/speaker-verification.mjs";
 import { sessionCookiePolicy } from "./lib/session-cookie-policy.mjs";
+import { speakerRegionSampleRange } from "./lib/live-speaker-regions.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 3001;
@@ -1002,6 +1003,7 @@ app.post("/api/speakers/identify", requireTrustedOrigin, requireAuth, requireOrg
       const expectedSpeakerId = String(request.body?.expectedSpeakerId || "").trim();
       const expectedSpeaker = expectedSpeakerId ? speakers.find(({ id }) => id === expectedSpeakerId) : null;
       if (expectedSpeakerId && !expectedSpeaker) return response.status(400).json({ error: "검증 대상 화자를 찾지 못했습니다." });
+      const verificationScore = expectedSpeakerScore(scores, speakers, expectedSpeakerId, decision.bestScore);
       const enrollmentAudioThreshold = Number(process.env.SPEAKER_DUPLICATE_AUDIO_THRESHOLD) || 0.985;
       let enrollmentAudioSimilarity = null;
       if (request.body?.independentRecording === "true" && expectedSpeaker?.referenceAudio) {
@@ -1019,7 +1021,7 @@ app.post("/api/speakers/identify", requireTrustedOrigin, requireAuth, requireOrg
       }
       const verification = speakerVerificationUpdate(expectedSpeaker, {
         fingerprint: speakerProbeFingerprint(samples),
-        score: decision.bestScore,
+        score: verificationScore,
         qualityScore: quality.score,
         independentRecording: request.body?.independentRecording === "true",
         expectedSpeakerId,
@@ -1066,7 +1068,8 @@ app.post("/api/speakers/identify", requireTrustedOrigin, requireAuth, requireOrg
           ...(enrollmentAudioSimilarity == null ? {} : {
             enrollmentAudioSimilarity,
             enrollmentAudioThreshold
-          })
+          }),
+          ...(expectedSpeaker ? { expectedSpeakerScore: verificationScore } : {})
         },
         speakerProfile
       });
@@ -1249,10 +1252,9 @@ liveServer.on("connection", async (client, request, requestUrl) => {
       for (const region of diarizedAudioRegions(words, { minimumDuration: 0.2 })) {
         const cacheKey = `${region.sourceSpeaker}:${region.start.toFixed(2)}:${region.end.toFixed(2)}`;
         if (analyzedRegions.has(cacheKey)) continue;
-        const firstSample = Math.max(audioHistory.earliestSample, Math.floor(region.start * speakerModelInfo.sampleRate));
-        const lastSample = Math.min(audioHistory.latestSample, Math.ceil(region.end * speakerModelInfo.sampleRate));
-        if (lastSample - firstSample < speakerModelInfo.sampleRate) continue;
-        const snapshot = audioHistory.slice(firstSample, lastSample);
+        const sampleRange = speakerRegionSampleRange(region, audioHistory, speakerModelInfo.sampleRate);
+        if (!sampleRange) continue;
+        const snapshot = audioHistory.slice(sampleRange.firstSample, sampleRange.lastSample);
         try {
           const pcm = new Int16Array(snapshot.buffer, snapshot.byteOffset, snapshot.byteLength / 2);
           const chunkQuality = analyzePcmQuality(pcm, speakerModelInfo.sampleRate);

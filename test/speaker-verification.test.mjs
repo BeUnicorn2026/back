@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { recordingEnvelopeSimilarity, speakerProbeFingerprint, speakerVerificationUpdate } from "../lib/speaker-verification.mjs";
+import { expectedSpeakerScore, recordingEnvelopeSimilarity, speakerProbeFingerprint, speakerVerificationUpdate } from "../lib/speaker-verification.mjs";
 
 function patternedPcm(seconds = 6, sampleRate = 16_000) {
   const pcm = new Int16Array(seconds * sampleRate);
@@ -71,4 +71,11 @@ test("requires the declared speaker to match the model decision", () => {
   });
   assert.equal(wrong.reason, "unexpected_identity");
   assert.equal(wrong.changes.lastVerificationOutcome, "misidentified");
+});
+
+test("records the declared speaker score instead of a wrong winner score", () => {
+  const speakers = [{ id: "speaker-a" }, { id: "speaker-b" }];
+  assert.equal(expectedSpeakerScore([0.66, 0.91], speakers, "speaker-a", 0.91), 0.66);
+  assert.equal(expectedSpeakerScore([0.66, 0.91], speakers, "", 0.91), 0.91);
+  assert.equal(expectedSpeakerScore([], speakers, "speaker-a"), null);
 });
