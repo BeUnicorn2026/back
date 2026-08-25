@@ -45,3 +45,10 @@ test("allows clean short speech to accumulate before the inference duration gate
   assert.equal(isSpeakerSignalQuality(quality), true);
   assert.equal(isSpeakerInferenceQuality(quality), false);
 });
+
+test("accepts clean quiet speech for inference without accepting it for enrollment", () => {
+  const quality = analyzePcmQuality(makePcm({ seconds: 2, amplitude: 300, voicedRatio: 0.6 }));
+  assert.ok(quality.rms >= 0.0035 && quality.rms < 0.008);
+  assert.equal(quality.usable, false);
+  assert.equal(isSpeakerInferenceQuality(quality), true);
+});
