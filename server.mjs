@@ -31,6 +31,7 @@ import { knowledgeTwinDefaults, normalizeConceptLabel } from "./lib/knowledge-tw
 import { personalizeKnowledgeTerms } from "./lib/knowledge-personalization.mjs";
 import { KnowledgeExplanationService, knowledgeExplanationCacheKey } from "./lib/knowledge-explanation.mjs";
 import { normalizeUploadFilename, uploadTitle } from "./lib/upload-filename.mjs";
+import { serviceReadiness } from "./lib/service-readiness.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 3001;
@@ -756,16 +757,31 @@ app.get("/api/health/ready", async (_request, response) => {
     if (postgresDatabase) await postgresDatabase.healthCheck();
     else (await openSqliteDatabase(databasePath)).prepare("SELECT 1").get();
     const deepgramConfigured = Boolean(process.env.DEEPGRAM_API_KEY);
+    const openaiConfigured = Boolean(process.env.OPENAI_API_KEY);
     const emailConfigured = emailService.mode === "resend" || process.env.NODE_ENV !== "production";
+    const biometricEncryptionConfigured = Boolean(process.env.VOICE_BIOMETRIC_KEY);
     const speakerModelReady = !shouldPreloadSpeakerModel || speakerModelState === "ready";
-    const ready = process.env.NODE_ENV !== "production" || (deepgramConfigured && emailConfigured && speakerModelReady);
-    response.status(ready ? 200 : 503).json({
-      ok: ready,
-      status: ready ? "ready" : "degraded",
+    const speakerStorageReady = speakerStorageMode !== "vercel-blob" || Boolean(process.env.BLOB_READ_WRITE_TOKEN);
+    const readiness = serviceReadiness({
+      environment: process.env.NODE_ENV,
+      deepgram: deepgramConfigured,
+      openai: openaiConfigured,
+      email: emailConfigured,
+      biometricEncryption: biometricEncryptionConfigured,
+      speakerModel: speakerModelReady,
+      speakerStorage: speakerStorageReady
+    });
+    response.status(readiness.ready ? 200 : 503).json({
+      ok: readiness.ready,
+      status: readiness.ready ? "ready" : "degraded",
       database: `${databaseMode}:ready`,
       deepgram: deepgramConfigured ? "configured" : "missing",
+      openai: openaiConfigured ? "configured" : "missing",
       email: emailConfigured ? emailService.mode : "missing",
+      biometricEncryption: biometricEncryptionConfigured ? "configured" : "missing",
+      speakerStorage: speakerStorageReady ? speakerStorageMode : "missing",
       speakerModel: speakerModelState,
+      missing: readiness.missing,
       ...(speakerModelFailure ? { speakerModelError: "모델을 준비하지 못했습니다." } : {})
     });
   } catch (error) {
