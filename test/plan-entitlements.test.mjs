@@ -4,13 +4,13 @@ import { entitlementPeriodStart, meetingAllowance, planEntitlements } from "../l
 
 test("maps every paid state to concrete server-enforced limits", () => {
   assert.deepEqual(planEntitlements({ planId: "FREE" }), {
-    planId: "FREE", meetingsPerPeriod: 5, meetingDurationSeconds: 1800, speakerProfiles: 2
+    planId: "FREE", meetingsPerPeriod: 3, meetingDurationSeconds: 1200, meetingParticipants: 5, speakerProfiles: 5
   });
   assert.deepEqual(planEntitlements({ planId: "PRO" }), {
-    planId: "PRO", meetingsPerPeriod: 100, meetingDurationSeconds: 10800, speakerProfiles: 20
+    planId: "PRO", meetingsPerPeriod: null, meetingDurationSeconds: 7200, meetingParticipants: 10, speakerProfiles: 10
   });
   assert.deepEqual(planEntitlements({ planId: "MAX" }), {
-    planId: "MAX", meetingsPerPeriod: null, meetingDurationSeconds: 28800, speakerProfiles: 100
+    planId: "MAX", meetingsPerPeriod: null, meetingDurationSeconds: null, meetingParticipants: 20, speakerProfiles: 20
   });
 });
 
@@ -21,10 +21,10 @@ test("uses the paid period start and a UTC calendar month for Free", () => {
 });
 
 test("blocks a finite meeting quota but keeps Max unlimited", () => {
-  assert.deepEqual(meetingAllowance(planEntitlements({ planId: "FREE" }), 4), {
-    allowed: true, used: 4, limit: 5, remaining: 1
+  assert.deepEqual(meetingAllowance(planEntitlements({ planId: "FREE" }), 2), {
+    allowed: true, used: 2, limit: 3, remaining: 1
   });
-  assert.equal(meetingAllowance(planEntitlements({ planId: "FREE" }), 5).allowed, false);
+  assert.equal(meetingAllowance(planEntitlements({ planId: "FREE" }), 3).allowed, false);
   assert.deepEqual(meetingAllowance(planEntitlements({ planId: "MAX" }), 10_000), {
     allowed: true, used: 10_000, limit: null, remaining: null
   });

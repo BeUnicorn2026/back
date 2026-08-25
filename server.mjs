@@ -384,7 +384,7 @@ async function requireMeetingAllowance(organizationId) {
 
 async function requireDurationAllowance(organizationId, durationSeconds) {
   const snapshot = await billingSnapshot(organizationId);
-  if (Number(durationSeconds) > snapshot.entitlements.meetingDurationSeconds) {
+  if (snapshot.entitlements.meetingDurationSeconds != null && Number(durationSeconds) > snapshot.entitlements.meetingDurationSeconds) {
     throw new BillingError(
       `${snapshot.entitlements.planId} 플랜의 회의당 최대 녹음 시간을 초과했습니다.`,
       402,
@@ -1152,6 +1152,9 @@ app.post("/api/speakers", requireTrustedOrigin, requireAuth, requireOrganization
   try {
     const existing = await loadCurrentSpeakerProfiles(request.auth.organization.id);
     const access = await billingSnapshot(request.auth.organization.id);
+    if (existing.some((speaker) => speaker.createdBy === request.auth.user.id)) {
+      return response.status(409).json({ error: "목소리는 사용자 본인당 한 개만 등록할 수 있습니다. 기존 프로필에 샘플을 추가해 주세요." });
+    }
     if (existing.length >= access.entitlements.speakerProfiles) {
       throw new BillingError(
         `${access.entitlements.planId} 플랜은 등록 화자를 ${access.entitlements.speakerProfiles}명까지 지원합니다.`,
@@ -1325,6 +1328,7 @@ app.post("/api/speakers/:id/samples", requireTrustedOrigin, requireAuth, require
     const registeredSpeakers = await loadCurrentSpeakerProfiles(request.auth.organization.id);
     const existing = registeredSpeakers.find(({ id }) => id === request.params.id);
     if (!existing) return response.status(404).json({ error: "등록된 목소리를 찾지 못했습니다." });
+    if (existing.createdBy && existing.createdBy !== request.auth.user.id) return response.status(403).json({ error: "본인의 목소리 프로필만 변경할 수 있습니다." });
     if ((existing.enrollmentSessionCount || 1) >= 8) return response.status(409).json({ error: "한 사람당 최대 8회까지 음성을 추가할 수 있습니다." });
     const pcm = await decodeToPcm(request.file.buffer);
     const duration = pcm.length / 2 / 16_000;
@@ -1374,6 +1378,9 @@ app.post("/api/speakers/:id/samples", requireTrustedOrigin, requireAuth, require
 
 app.delete("/api/speakers/:id", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
   if (!/^[a-f0-9-]{36}$/i.test(request.params.id)) return response.status(400).json({ error: "잘못된 화자 ID입니다." });
+  const existing = (await speakerStore.list(request.auth.organization.id)).find(({ id }) => id === request.params.id);
+  if (!existing) return response.status(404).json({ error: "등록된 목소리를 찾지 못했습니다." });
+  if (existing.createdBy && existing.createdBy !== request.auth.user.id) return response.status(403).json({ error: "본인의 목소리 프로필만 삭제할 수 있습니다." });
   const removed = await speakerStore.remove(request.params.id, request.auth.organization.id);
   if (!removed) return response.status(404).json({ error: "등록된 목소리를 찾지 못했습니다." });
   response.status(204).end();
@@ -1560,7 +1567,9 @@ liveServer.on("connection", async (client, request, requestUrl) => {
 
     let transcriptQueue = Promise.resolve();
     let forwardedAudioBytes = 0;
-    const maximumAudioBytes = billingAccess.entitlements.meetingDurationSeconds * speakerModelInfo.sampleRate * 2;
+    const maximumAudioBytes = billingAccess.entitlements.meetingDurationSeconds == null
+      ? Number.POSITIVE_INFINITY
+      : billingAccess.entitlements.meetingDurationSeconds * speakerModelInfo.sampleRate * 2;
     let finalizationAcknowledged = false;
     let diarizationWarningSent = false;
     const acknowledgeFinalization = () => {
