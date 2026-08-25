@@ -12,6 +12,7 @@ import { normalizeTranscript } from "./lib/normalize-transcript.mjs";
 import { assessNewSpeakerSeparation, assessSpeakerProfileExtension, getSpeakerEmbeddingModel, mergeSpeakerProfileVectors, speakerInferenceInfo, speakerModelInfo } from "./lib/speaker-embedding-model.mjs";
 import { diarizedAudioRegions, speakerDecision, SpeakerIdentityTracker, wordsToSegments, wordsToTranscriptSegments } from "./lib/speaker-matching.mjs";
 import { SpeakerAudioAccumulator } from "./lib/speaker-audio-accumulator.mjs";
+import { migrateSpeakerProfiles, speakerProfileNeedsMigration } from "./lib/speaker-profile-migration.mjs";
 import { SpeakerStore } from "./lib/speaker-store.mjs";
 import { MeetingStore } from "./lib/meeting-store.mjs";
 import { reconcileTranscriptSpeakers } from "./lib/reconcile-speakers.mjs";
@@ -419,7 +420,7 @@ async function transcribeAudioFile(file, language, organizationId) {
   form.append("chunking_strategy", "auto");
   if (language) form.append("language", language);
 
-  const allKnownSpeakers = await speakerStore.loadProfiles(organizationId);
+  const allKnownSpeakers = await loadCurrentSpeakerProfiles(organizationId);
   const knownSpeakerReferences = [];
   for (const speaker of allKnownSpeakers) {
     if (knownSpeakerReferences.length >= 4) break;
@@ -468,8 +469,8 @@ async function transcribeAudioFile(file, language, organizationId) {
     const originalPcm = new Int16Array(decoded.buffer, decoded.byteOffset, Math.floor(decoded.byteLength / 2));
     const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath);
     return await reconcileTranscriptSpeakers(normalized, originalPcm, allKnownSpeakers, model, {
-      threshold: Number(process.env.SPEAKER_MATCH_THRESHOLD) || 0.72,
-      margin: Number(process.env.SPEAKER_MATCH_MARGIN) || 0.04
+      threshold: Number(process.env.SPEAKER_MATCH_THRESHOLD) || speakerModelInfo.defaultMatchThreshold,
+      margin: Number(process.env.SPEAKER_MATCH_MARGIN) || speakerModelInfo.defaultMatchMargin
     });
   } catch (speakerError) {
     console.error("Final speaker reconciliation failed:", speakerError);
@@ -498,6 +499,36 @@ async function enrollProfile(pcm) {
     consistency: profile.consistency,
     matchThreshold: profile.matchThreshold
   };
+}
+
+const speakerProfileMigrationPromises = new Map();
+
+async function loadCurrentSpeakerProfiles(organizationId) {
+  const speakers = await speakerStore.loadProfiles(organizationId);
+  if (!speakers.some((speaker) => speakerProfileNeedsMigration(speaker, speakerModelInfo))) return speakers;
+
+  let migration = speakerProfileMigrationPromises.get(organizationId);
+  if (!migration) {
+    migration = (async () => {
+      const model = await prepareSpeakerModel();
+      const migrated = await migrateSpeakerProfiles(speakers, {
+        model,
+        modelInfo: speakerModelInfo,
+        decodeReference: async (referenceAudio) => {
+          const decoded = await decodeToPcm(referenceAudio);
+          return new Int16Array(decoded.buffer, decoded.byteOffset, Math.floor(decoded.byteLength / 2));
+        },
+        replace: (metadata, profile, referenceAudio) =>
+          speakerStore.replace(metadata, profile, referenceAudio, organizationId)
+      });
+      if (migrated.length) {
+        console.log(JSON.stringify({ level: "info", event: "speaker_profiles_migrated", organizationId, migrated }));
+      }
+    })().finally(() => speakerProfileMigrationPromises.delete(organizationId));
+    speakerProfileMigrationPromises.set(organizationId, migration);
+  }
+  await migration;
+  return speakerStore.loadProfiles(organizationId);
 }
 
 app.disable("x-powered-by");
@@ -962,7 +993,7 @@ app.post("/api/speakers", requireTrustedOrigin, requireAuth, requireOrganization
   if (!request.file) return response.status(400).json({ error: "MP3 또는 WAV 등록 음성이 필요합니다." });
 
   try {
-    const existing = await speakerStore.loadProfiles(request.auth.organization.id);
+    const existing = await loadCurrentSpeakerProfiles(request.auth.organization.id);
     if (existing.some((speaker) => speaker.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
       return response.status(409).json({ error: "이미 등록된 이름입니다." });
     }
@@ -1018,7 +1049,7 @@ app.post("/api/speakers/identify", requireTrustedOrigin, requireAuth, requireOrg
   speakerIdentificationRateLimit, upload.single("voice"), async (request, response) => {
     if (!request.file) return response.status(400).json({ error: "식별할 MP3 또는 WAV 음성이 필요합니다." });
     try {
-      const speakers = await speakerStore.loadProfiles(request.auth.organization.id);
+      const speakers = await loadCurrentSpeakerProfiles(request.auth.organization.id);
       if (!speakers.length) return response.status(409).json({ error: "먼저 한 명 이상의 목소리를 등록해 주세요." });
       const pcm = await decodeToPcm(request.file.buffer, 15);
       const samples = new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2));
@@ -1033,8 +1064,8 @@ app.post("/api/speakers/identify", requireTrustedOrigin, requireAuth, requireOrg
       const scores = await model.compare(samples, speakers.map(({ profiles }) => profiles), { maximumEmbeddings: 3 });
       if (!scores) return response.status(422).json({ error: "식별할 수 있는 말소리가 충분하지 않습니다.", quality });
       const decision = speakerDecision(scores, speakers, {
-        threshold: Number(process.env.SPEAKER_MATCH_THRESHOLD) || 0.72,
-        margin: Number(process.env.SPEAKER_MATCH_MARGIN) || 0.04
+        threshold: Number(process.env.SPEAKER_MATCH_THRESHOLD) || speakerModelInfo.defaultMatchThreshold,
+        margin: Number(process.env.SPEAKER_MATCH_MARGIN) || speakerModelInfo.defaultMatchMargin
       });
       const reasonMessages = {
         accepted: `${decision.identity?.name || "등록 화자"}님의 목소리로 판정했습니다.`,
@@ -1125,7 +1156,7 @@ app.post("/api/speakers/:id/samples", requireTrustedOrigin, requireAuth, require
   if (!/^[a-f0-9-]{36}$/i.test(request.params.id)) return response.status(400).json({ error: "잘못된 화자 ID입니다." });
   if (!request.file) return response.status(400).json({ error: "MP3 또는 WAV 추가 음성이 필요합니다." });
   try {
-    const registeredSpeakers = await speakerStore.loadProfiles(request.auth.organization.id);
+    const registeredSpeakers = await loadCurrentSpeakerProfiles(request.auth.organization.id);
     const existing = registeredSpeakers.find(({ id }) => id === request.params.id);
     if (!existing) return response.status(404).json({ error: "등록된 목소리를 찾지 못했습니다." });
     if ((existing.enrollmentSessionCount || 1) >= 8) return response.status(409).json({ error: "한 사람당 최대 8회까지 음성을 추가할 수 있습니다." });
@@ -1258,11 +1289,8 @@ liveServer.on("connection", async (client, request, requestUrl) => {
     if (!auth) throw new Error("로그인이 필요합니다.");
     if (!auth.organization) throw new Error("먼저 조직을 만들거나 가입해 주세요.");
     const mode = requestUrl.searchParams.get("mode") === "speaker" ? "speaker" : "stt";
-    const speakers = mode === "speaker" ? await speakerStore.loadProfiles(auth.organization.id) : [];
+    const speakers = mode === "speaker" ? await loadCurrentSpeakerProfiles(auth.organization.id) : [];
     if (mode === "speaker" && !speakers.length) throw new Error("화자 식별 모드에는 등록 목소리가 한 명 이상 필요합니다.");
-    if (mode === "speaker" && speakers.some(({ profiles }) => profiles.some((profile) => profile.length !== speakerModelInfo.dimensions))) {
-      throw new Error("이전 방식으로 등록된 목소리가 있습니다. 삭제하고 다시 등록해 주세요.");
-    }
     let preparationTimer = null;
     if (mode === "speaker" && speakerModelState !== "ready" && client.readyState === WebSocket.OPEN) {
       const preparationStartedAt = Date.now();
@@ -1292,7 +1320,10 @@ liveServer.on("connection", async (client, request, requestUrl) => {
     const analyzedRegions = new Set();
     const pendingSpeakerClusters = new Set();
     const audioHistory = new PcmHistoryBuffer(speakerModelInfo.sampleRate * 90);
-    const speakerAudioAccumulator = new SpeakerAudioAccumulator({ sampleRate: speakerModelInfo.sampleRate });
+    const speakerAudioAccumulator = new SpeakerAudioAccumulator({
+      sampleRate: speakerModelInfo.sampleRate,
+      minimumSeconds: speakerInferenceInfo.windowSeconds
+    });
 
     const analyzeDiarizedRegions = async (words) => {
       for (const region of diarizedAudioRegions(words, { minimumDuration: 0.2 })) {
@@ -1418,8 +1449,8 @@ liveServer.on("connection", async (client, request, requestUrl) => {
           if (mode === "speaker" && event.is_final) await analyzeDiarizedRegions(alternative.words);
           const segments = mode === "speaker"
             ? wordsToSegments(alternative.words, recognitionFrames, speakers, {
-              threshold: Number(process.env.SPEAKER_MATCH_THRESHOLD) || 0.72,
-              margin: Number(process.env.SPEAKER_MATCH_MARGIN) || 0.04,
+              threshold: Number(process.env.SPEAKER_MATCH_THRESHOLD) || speakerModelInfo.defaultMatchThreshold,
+              margin: Number(process.env.SPEAKER_MATCH_MARGIN) || speakerModelInfo.defaultMatchMargin,
               tracker: identityTracker,
               pendingSpeakerClusters
             })

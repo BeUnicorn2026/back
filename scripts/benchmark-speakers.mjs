@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { analyzePcmQuality, isSpeakerInferenceQuality } from "../lib/audio-quality.mjs";
 import { assertIndependentBenchmarkRecordings } from "../lib/speaker-benchmark-validation.mjs";
-import { getSpeakerEmbeddingModel, mergeSpeakerProfileVectors, speakerInferenceInfo } from "../lib/speaker-embedding-model.mjs";
+import { getSpeakerEmbeddingModel, mergeSpeakerProfileVectors, speakerInferenceInfo, speakerModelInfo } from "../lib/speaker-embedding-model.mjs";
 import { assessBenchmarkCoverage, calibrateSpeakerThreshold, evaluateSpeakerTrials } from "../lib/speaker-evaluation.mjs";
 
 const argumentsList = process.argv.slice(2);
@@ -23,8 +23,8 @@ Manifest:
     { "file": "audio/alice-test.wav", "speakerId": "alice" },
     { "file": "audio/unknown.wav", "speakerId": null }
   ],
-  "threshold": 0.72,
-  "margin": 0.04,
+  "threshold": 0.84,
+  "margin": 0.05,
   "duplicateAudioThreshold": 0.985
 }
 
@@ -153,8 +153,8 @@ for (const probe of probeRecordings) {
   trials.push({ file: probe.file, expectedSpeakerId: probe.speakerId, scores });
 }
 
-const threshold = Number(manifest.threshold ?? 0.72);
-const margin = Number(manifest.margin ?? 0.04);
+const threshold = Number(manifest.threshold ?? speakerModelInfo.defaultMatchThreshold);
+const margin = Number(manifest.margin ?? speakerModelInfo.defaultMatchMargin);
 const coverage = assessBenchmarkCoverage(trials, speakers, Number(manifest.minimumProbesPerClass) || 5);
 const calibration = coverage.ready
   ? calibrateSpeakerThreshold(trials, speakers, {
@@ -168,7 +168,7 @@ const calibration = coverage.ready
   : { ready: false, reason: "보정값을 제안하려면 coverage 경고를 먼저 해소해야 합니다." };
 const report = {
   generatedAt: new Date().toISOString(),
-  model: "Xenova/wavlm-base-plus-sv",
+  model: speakerModelInfo.id,
   inference: speakerInferenceInfo,
   dataset: { speakers: speakers.length, probes: trials.length },
   validation,

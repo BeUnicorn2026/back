@@ -29,6 +29,13 @@ test("explains whether a probe failed its threshold or separation margin", () =>
   assert.equal(accepted.reason, "accepted");
 });
 
+test("never lets a legacy profile threshold weaken the configured open-set floor", () => {
+  const legacy = [{ id: "one", name: "민수", matchThreshold: 0.72 }, { id: "two", name: "지수" }];
+  const decision = speakerDecision([0.83, 0.2], legacy, { threshold: 0.84, margin: 0.05 });
+  assert.equal(decision.reason, "below_threshold");
+  assert.equal(decision.requiredThreshold, 0.84);
+});
+
 test("uses enrollment-specific thresholds and stabilizes a diarized speaker cluster", () => {
   const calibrated = [{ id: "one", name: "민수", matchThreshold: 0.78 }, { id: "two", name: "지수" }];
   assert.equal(chooseKnownSpeaker([0.76, 0.2], calibrated), null);
@@ -222,11 +229,11 @@ test("selects dense full-length speech windows without increasing real-time infe
   const defaultWindows = speakerInferenceWindows(pcm);
   assert.equal(defaultWindows.length, 1);
   const [best] = defaultWindows;
-  assert.equal(best.length, 3 * 16_000);
+  assert.equal(best.length, 4 * 16_000);
   assert.ok(pcmRms(best) > pcmRms(pcm));
   const diverse = speakerInferenceWindows(pcm, { maximumEmbeddings: 3 });
-  assert.equal(diverse.length, 3);
-  assert.ok(diverse.every((window) => window.length === 3 * 16_000));
+  assert.equal(diverse.length, 2);
+  assert.ok(diverse.every((window) => window.length === 4 * 16_000));
 });
 
 test("merges and deduplicates speaker profiles across enrollment sessions", () => {
@@ -236,7 +243,7 @@ test("merges and deduplicates speaker profiles across enrollment sessions", () =
   ]);
   assert.equal(result.vectors.length, 4);
   assert.ok(result.consistency > 0.9);
-  assert.ok(result.matchThreshold >= 0.68 && result.matchThreshold <= 0.82);
+  assert.ok(result.matchThreshold >= 0.84 && result.matchThreshold <= 0.9);
 });
 
 test("accepts matching enrollment extensions and rejects another registered speaker", () => {

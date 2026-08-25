@@ -14,9 +14,12 @@ test("retries speaker model initialization after a failure instead of caching re
 test("runs inference for clean speech below the stricter enrollment volume", async () => {
   let inferenceCalls = 0;
   const model = new SpeakerEmbeddingModel({
-    run: async () => {
+    run: async (feeds) => {
       inferenceCalls += 1;
-      return { embeddings: { data: new Float32Array([1, 0]) } };
+      assert.deepEqual(Object.keys(feeds), ["feats"]);
+      assert.deepEqual(feeds.feats.dims.slice(0, 1), [1]);
+      assert.equal(feeds.feats.dims[2], 80);
+      return { embs: { data: new Float32Array([1, 0]) } };
     }
   });
   const pcm = new Int16Array(2 * 16_000);
