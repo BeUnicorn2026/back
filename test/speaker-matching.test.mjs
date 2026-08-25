@@ -132,6 +132,19 @@ test("extracts only sufficiently long contiguous regions from each diarized spea
   ]);
 });
 
+test("does not coerce missing diarization labels into speaker A", () => {
+  assert.deepEqual(diarizedAudioRegions([
+    { start: 0, end: 1.5, word: "누락" },
+    { start: 2, end: 3.2, word: "정상", speaker: 1 }
+  ]), [{ sourceSpeaker: "1", start: 2, end: 3.2, wordCount: 1 }]);
+
+  const [segment] = wordsToSegments([
+    { start: 3, end: 4, word: "화자값없음" }
+  ], [], speakers);
+  assert.equal(segment.speaker, "화자 정보 없음");
+  assert.equal(segment.sourceSpeaker, null);
+});
+
 test("does not mix overlapping embeddings from another diarization cluster", () => {
   const frames = [
     { start: 0, end: 2, sourceSpeaker: "1", scores: [0.1, 0.95], weight: 2 },

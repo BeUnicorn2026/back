@@ -1265,6 +1265,7 @@ liveServer.on("connection", async (client, request, requestUrl) => {
 
     let transcriptQueue = Promise.resolve();
     let finalizationAcknowledged = false;
+    let diarizationWarningSent = false;
     const acknowledgeFinalization = () => {
       if (finalizationAcknowledged) return;
       finalizationAcknowledged = true;
@@ -1279,6 +1280,17 @@ liveServer.on("connection", async (client, request, requestUrl) => {
       const alternative = event.channel?.alternatives?.[0];
       if (alternative?.words?.length) {
         transcriptQueue = transcriptQueue.then(async () => {
+          const hasDiarizationLabels = alternative.words.some(({ speaker }) =>
+            speaker != null && speaker !== "" && Number.isInteger(Number(speaker)) && Number(speaker) >= 0);
+          if (mode === "speaker" && event.is_final && !hasDiarizationLabels && !diarizationWarningSent) {
+            diarizationWarningSent = true;
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(JSON.stringify({
+                type: "warning",
+                message: "화자 분리 정보가 없는 구간을 받았습니다. 잘못된 이름을 붙이지 않고 ‘화자 정보 없음’으로 보존합니다. 계속되면 Deepgram diarization 설정을 확인해 주세요."
+              }));
+            }
+          }
           if (mode === "speaker" && event.is_final) await analyzeDiarizedRegions(alternative.words);
           const segments = mode === "speaker"
             ? wordsToSegments(alternative.words, recognitionFrames, speakers, {
