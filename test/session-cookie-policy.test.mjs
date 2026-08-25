@@ -24,3 +24,21 @@ test("keeps same-origin and development sessions lax unless explicitly configure
     clientOrigin: "http://localhost:3000"
   }), { httpOnly: true, sameSite: "lax", secure: false, path: "/" });
 });
+
+test("marks a cross-origin HTTPS session secure even when the local service uses development diagnostics", () => {
+  assert.deepEqual(sessionCookiePolicy({
+    environment: "development",
+    configuredSameSite: "none",
+    serverOrigin: "https://api.ssu-on.com",
+    clientOrigin: "https://unithon.ssu-on.com"
+  }), { httpOnly: true, sameSite: "none", secure: true, path: "/" });
+});
+
+test("does not emit a browser-invalid SameSite None cookie over local HTTP", () => {
+  assert.deepEqual(sessionCookiePolicy({
+    environment: "development",
+    configuredSameSite: "none",
+    serverOrigin: "http://localhost:7071",
+    clientOrigin: "http://localhost:5173"
+  }), { httpOnly: true, sameSite: "lax", secure: false, path: "/" });
+});
