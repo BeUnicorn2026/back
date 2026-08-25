@@ -41,6 +41,7 @@ import { isSupportedAudioUpload } from "./lib/audio-upload.mjs";
 import { selectSpeakerReferencePcm } from "./lib/speaker-reference.mjs";
 import { canForwardLiveAudio } from "./lib/live-audio-backpressure.mjs";
 import { buildDeepgramLiveQuery } from "./lib/deepgram-live-options.mjs";
+import { createDeepgramKeepAlive, deepgramApplicationError, parseDeepgramLiveEvent } from "./lib/deepgram-live-connection.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 3001;
@@ -1251,6 +1252,7 @@ liveServer.on("connection", async (client, request, requestUrl) => {
 
   let deepgram;
   let finalizeFallback;
+  let providerKeepAlive;
   try {
     const auth = await authStore.getContextBySession(sessionToken(request));
     if (!auth) throw new Error("로그인이 필요합니다.");
@@ -1344,9 +1346,12 @@ liveServer.on("connection", async (client, request, requestUrl) => {
       headers: { Authorization: `Token ${process.env.DEEPGRAM_API_KEY}` }
     });
 
-    deepgram.on("open", () => client.readyState === WebSocket.OPEN && client.send(JSON.stringify({
-      type: "ready", mode, sampleRate: speakerModelInfo.sampleRate, speakers: speakers.map(({ id, name }) => ({ id, name }))
-    })));
+    deepgram.on("open", () => {
+      providerKeepAlive = createDeepgramKeepAlive(deepgram);
+      if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({
+        type: "ready", mode, sampleRate: speakerModelInfo.sampleRate, speakers: speakers.map(({ id, name }) => ({ id, name }))
+      }));
+    });
 
     let transcriptQueue = Promise.resolve();
     let finalizationAcknowledged = false;
@@ -1360,7 +1365,29 @@ liveServer.on("connection", async (client, request, requestUrl) => {
       });
     };
     deepgram.on("message", (raw) => {
-      const event = JSON.parse(raw.toString());
+      const parsed = parseDeepgramLiveEvent(raw);
+      if (!parsed.ok) {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({
+            type: "error",
+            message: "실시간 STT 응답이 손상되어 현재까지의 기록을 안전하게 종료합니다."
+          }), () => deepgram.readyState === WebSocket.OPEN && deepgram.close(1002, "invalid provider response"));
+        } else if (deepgram.readyState === WebSocket.OPEN) {
+          deepgram.close(1002, "invalid provider response");
+        }
+        return;
+      }
+      const event = parsed.event;
+      const providerError = deepgramApplicationError(event);
+      if (providerError) {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({ type: "error", message: providerError.message, code: providerError.code }),
+            () => deepgram.readyState === WebSocket.OPEN && deepgram.close(1011, "provider error"));
+        } else if (deepgram.readyState === WebSocket.OPEN) {
+          deepgram.close(1011, "provider error");
+        }
+        return;
+      }
       if (event.type === "SpeechStarted") {
         if (client.readyState === WebSocket.OPEN) {
           client.send(JSON.stringify({ type: "speech_started", timestamp: Number(event.timestamp) || 0 }));
@@ -1413,9 +1440,18 @@ liveServer.on("connection", async (client, request, requestUrl) => {
     });
 
     deepgram.on("error", (error) => {
-      if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: "error", message: `실시간 STT 연결 오류: ${error.message}` }));
+      console.error("Deepgram live connection failed:", error);
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({
+          type: "error",
+          message: "실시간 STT 제공자 연결이 불안정해 현재까지의 기록을 안전하게 종료합니다. 잠시 후 다시 시도해 주세요."
+        }));
+      }
     });
-    deepgram.on("close", () => client.readyState === WebSocket.OPEN && client.close(1011, "STT connection closed"));
+    deepgram.on("close", () => {
+      providerKeepAlive?.stop();
+      if (client.readyState === WebSocket.OPEN) client.close(1011, "STT connection closed");
+    });
 
     client.on("message", (data, isBinary) => {
       if (deepgram.readyState !== WebSocket.OPEN) return;
@@ -1454,6 +1490,7 @@ liveServer.on("connection", async (client, request, requestUrl) => {
         return;
       }
       deepgram.send(incoming);
+      providerKeepAlive?.markAudioForwarded();
       if (mode !== "speaker") return;
       audioHistory.append(incoming);
     });
@@ -1465,6 +1502,7 @@ liveServer.on("connection", async (client, request, requestUrl) => {
 
   client.on("close", () => {
     clearTimeout(finalizeFallback);
+    providerKeepAlive?.stop();
     if (deepgram?.readyState === WebSocket.OPEN) {
       deepgram.send(JSON.stringify({ type: "CloseStream" }));
       deepgram.close();
