@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import WebSocket from "ws";
 
 const [audioPath] = process.argv.slice(2);
-const baseUrl = process.env.STT_TEST_URL || "http://localhost:3000";
+const baseUrl = process.env.STT_TEST_URL || "http://localhost:3001";
 const email = process.env.STT_TEST_EMAIL;
 const password = process.env.STT_TEST_PASSWORD;
 const mode = process.env.STT_TEST_MODE === "speaker" ? "speaker" : "stt";
@@ -14,7 +14,7 @@ if (process.argv.includes("--help") || process.argv.includes("-h")) {
   console.log(`Usage: STT_TEST_EMAIL=... STT_TEST_PASSWORD=... npm run test:live-stt -- <audio-file>
 
 Options:
-  STT_TEST_URL       Service URL (default: http://localhost:3000)
+  STT_TEST_URL       Backend URL (default: http://localhost:3001)
   STT_TEST_EMAIL     Existing account email
   STT_TEST_PASSWORD  Existing account password
   STT_TEST_MODE      stt (default) or speaker
