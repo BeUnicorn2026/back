@@ -48,7 +48,7 @@ import { PostgresBillingStore } from "./lib/postgres-billing-store.mjs";
 import { publicBillingPlans } from "./lib/billing-plans.mjs";
 import { TossPaymentsClient, TossPaymentsError } from "./lib/toss-payments-client.mjs";
 import { entitlementPeriodStart, meetingAllowance, planEntitlements } from "./lib/plan-entitlements.mjs";
-import { GoMeetMapClient } from "./lib/go-meetmap-client.mjs";
+import { GoMeetMapClient, mergeMeetMapIntelligence } from "./lib/go-meetmap-client.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 7070;
@@ -1033,8 +1033,12 @@ app.post("/api/meetmap/jobs", requireTrustedOrigin, requireAuth, requireOrganiza
   liveMeetMapRateLimit, async (request, response) => {
     const tenantKey = `${request.auth.organization.id}:${request.auth.user.id}`;
     try {
+      const meetingId = typeof request.body?.meetingId === "string" ? request.body.meetingId : "";
+      if (meetingId && !await meetingStore.get(meetingId, request.auth.organization.id)) {
+        return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
+      }
       const result = await goMeetMapClient.submit({
-        meetingId: typeof request.body?.meetingId === "string" ? request.body.meetingId : "",
+        meetingId,
         segments: Array.isArray(request.body?.segments) ? request.body.segments : [],
         tenantKey
       });
@@ -1048,10 +1052,37 @@ app.post("/api/meetmap/jobs", requireTrustedOrigin, requireAuth, requireOrganiza
 app.get("/api/meetmap/jobs/:id", requireAuth, requireOrganization, async (request, response) => {
   const tenantKey = `${request.auth.organization.id}:${request.auth.user.id}`;
   try {
-    return response.json(await goMeetMapClient.get(request.params.id, tenantKey));
+    const result = await goMeetMapClient.get(request.params.id, tenantKey);
+    if (result.job?.status === "succeeded" && result.job.meetingId && result.job.result) {
+      const meeting = await meetingStore.get(result.job.meetingId, request.auth.organization.id);
+      if (meeting && result.job.result.analyzedSegmentCount === meeting.segments.length) {
+        const hash = transcriptHash(meeting.segments);
+        const existing = await meetingStore.getIntelligence(meeting.id, request.auth.organization.id, hash);
+        await meetingStore.saveIntelligence({
+          meetingId: meeting.id,
+          organizationId: request.auth.organization.id,
+          transcriptHash: hash,
+          source: result.job.result.source,
+          model: result.job.result.model,
+          result: mergeMeetMapIntelligence(existing, meeting, result.job.result)
+        });
+      }
+    }
+    return response.json(result);
   } catch (error) {
     return response.status(Number(error?.status) || 502).json({ error: error.message || "대화 구조 분석 상태를 확인하지 못했습니다." });
   }
+});
+
+app.get("/api/meetings/:id/meetmap", requireAuth, requireOrganization, async (request, response) => {
+  const meeting = await meetingStore.get(request.params.id, request.auth.organization.id);
+  if (!meeting) return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
+  const intelligence = await meetingStore.getIntelligence(
+    meeting.id,
+    request.auth.organization.id,
+    transcriptHash(meeting.segments)
+  );
+  response.json({ meetMap: intelligence?.meetMap || null });
 });
 
 app.post("/api/meetings", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {

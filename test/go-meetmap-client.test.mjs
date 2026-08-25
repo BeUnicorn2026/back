@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { GoMeetMapClient } from "../lib/go-meetmap-client.mjs";
+import { GoMeetMapClient, mergeMeetMapIntelligence } from "../lib/go-meetmap-client.mjs";
 
 test("forwards authenticated tenant-scoped MeetMap jobs to Go", async () => {
   const requests = [];
@@ -28,4 +28,16 @@ test("fails closed when the internal Go service is not configured", async () => 
   const client = new GoMeetMapClient();
   await assert.rejects(client.submit({ segments: [] }), (error) => error.status === 503);
   await assert.rejects(client.get("not-a-job", "tenant"), /작업 ID/);
+});
+
+test("merges MeetMap into saved intelligence without persisting cache metadata", () => {
+  const meetMap = { topics: [{ id: "topic-1" }], source: "openrouter", model: "stealth/ox-alpha" };
+  const merged = mergeMeetMapIntelligence({
+    title: "기존 회의", summary: "기존 요약", topics: [{ id: "legacy" }], terms: [], actions: [],
+    source: "openai", model: "old", transcriptHash: "hash", generatedAt: "now", meetMap: { topics: [] }
+  }, { title: "원본 회의" }, meetMap);
+  assert.equal(merged.title, "기존 회의");
+  assert.equal(merged.meetMap, meetMap);
+  assert.equal("transcriptHash" in merged, false);
+  assert.equal("generatedAt" in merged, false);
 });
