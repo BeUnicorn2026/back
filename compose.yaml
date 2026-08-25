@@ -1,19 +1,20 @@
 services:
   voice-partition:
     build: .
+    image: voice-partition-back:local
     init: true
     restart: unless-stopped
     mem_limit: 5g
     mem_reservation: 1g
     pids_limit: 512
     ports:
-      - "3001:3001"
+      - "127.0.0.1:7070:7070"
     env_file:
-      - .env
+      - ${BACKEND_ENV_FILE:-.env}
     environment:
       NODE_ENV: production
       NODE_OPTIONS: --max-old-space-size=4096
-      PORT: 3001
+      PORT: 7070
       VOICE_PARTITION_DATA_DIR: /app/.data
       SPEAKER_MODEL_CACHE: /app/.cache/speaker-models
       PRELOAD_SPEAKER_MODEL: "true"
@@ -23,7 +24,42 @@ services:
     tmpfs:
       - /tmp:size=256m,mode=1777
     stop_grace_period: 15s
+    networks:
+      - voice-partition
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    pull_policy: always
+    restart: unless-stopped
+    mem_limit: 256m
+    pids_limit: 128
+    depends_on:
+      voice-partition:
+        condition: service_healthy
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:?CLOUDFLARE_TUNNEL_TOKEN is required}
+    networks:
+      - voice-partition
+
+  updater:
+    build:
+      context: deploy/updater
+    image: voice-partition-updater:local
+    restart: unless-stopped
+    mem_limit: 256m
+    pids_limit: 128
+    environment:
+      DEPLOY_BRANCH: main
+      UPDATE_INTERVAL_SECONDS: ${UPDATE_INTERVAL_SECONDS:-60}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOST_REPOSITORY_PATH:?HOST_REPOSITORY_PATH is required}:/workspace
+    networks:
+      - voice-partition
 
 volumes:
   voice-partition-data:
   voice-partition-speaker-models:
+
+networks:
+  voice-partition:
+    name: voice-partition
