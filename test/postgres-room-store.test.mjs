@@ -68,7 +68,9 @@ test("PostgreSQL room store handles idempotency, concurrency, and distinct colli
     assert.equal(Object.hasOwn(await store.get(first.id, "org-a"), "accessCode"), false);
     assert.equal(Object.hasOwn(await store.getByRoom(first.room, "org-a"), "accessCode"), false);
     assert.equal(Object.hasOwn((await store.listForUser("owner-a", "org-a"))[0], "accessCode"), false);
-    await assert.rejects(store.create({ ...request, idempotencyKey: "different" }), hasCode("ROOM_EXISTS"));
+    const resumed = await store.create({ ...request, idempotencyKey: "different" });
+    assert.equal(resumed.id, first.id);
+    assert.equal(resumed.accessCode, first.accessCode);
     const retried = await store.create({
       organizationId: "org-a", createdBy: "owner-a", room: "CD34", idempotencyKey: "next"
     });

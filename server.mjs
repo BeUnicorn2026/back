@@ -495,6 +495,7 @@ function publicKnowledgeExplanation(stored) {
     term: stored.term,
     level: stored.level,
     explanation: stored.result.explanation,
+    rewrittenContext: stored.result.rewrittenContext || "",
     analogy: stored.result.analogy,
     checkQuestion: stored.result.checkQuestion,
     choices: stored.result.choices,
@@ -1009,12 +1010,12 @@ app.post("/api/knowledge/explanations", requireTrustedOrigin, requireAuth, requi
     const segmentIndex = Number.isInteger(requestedIndex) && requestedIndex >= 0 && requestedIndex < meeting.segments.length
       ? requestedIndex : null;
     const context = segmentIndex == null ? "" : String(meeting.segments[segmentIndex]?.text || "").trim();
-    const roles = request.auth.user.vocabulary?.roles || [];
+    const introduction = request.auth.user.introduction || "";
     const cacheKey = knowledgeExplanationCacheKey({
       term: analyzedTerm.term,
       definition,
       context,
-      roles,
+      introduction,
       level,
       model: `${knowledgeExplanationService.mode}:${knowledgeExplanationService.model}`
     });
@@ -1026,7 +1027,7 @@ app.post("/api/knowledge/explanations", requireTrustedOrigin, requireAuth, requi
         term: analyzedTerm.term,
         definition,
         context,
-        roles,
+        introduction,
         level
       });
       const stored = await knowledgeStore.saveExplanation({

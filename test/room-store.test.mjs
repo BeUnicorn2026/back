@@ -67,9 +67,11 @@ test("SQLite room create is idempotent and distinguishes room and access-code co
   assert.equal(Object.hasOwn(await store.getByRoom(first.room, organization.id), "accessCode"), false);
   assert.equal(Object.hasOwn((await store.listForUser(owner.id, organization.id))[0], "accessCode"), false);
 
-  await assert.rejects(store.create({
+  const resumed = await store.create({
     organizationId: organization.id, createdBy: owner.id, room: "AB12", idempotencyKey: "other"
-  }), hasCode("ROOM_EXISTS"));
+  });
+  assert.equal(resumed.id, first.id);
+  assert.equal(resumed.accessCode, first.accessCode);
   const retried = await store.create({
     organizationId: organization.id, createdBy: owner.id, room: "CD34", idempotencyKey: "third"
   });
