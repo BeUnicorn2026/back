@@ -895,7 +895,16 @@ app.post("/api/meetings/:id/intelligence", requireTrustedOrigin, requireAuth, re
     const hash = transcriptHash(meeting.segments);
     if (!request.body?.force) {
       const cached = await meetingStore.getIntelligence(meeting.id, request.auth.organization.id, hash);
-      if (cached) return response.json({ intelligence: await personalizedIntelligenceFor(request.auth.user, cached), cached: true });
+      if (cached) {
+        const cachedMeeting = cached.title && cached.title !== meeting.title
+          ? await meetingStore.update(meeting.id, request.auth.organization.id, { title: cached.title })
+          : meeting;
+        return response.json({
+          intelligence: await personalizedIntelligenceFor(request.auth.user, cached),
+          meeting: cachedMeeting,
+          cached: true
+        });
+      }
     }
     try {
       const result = await meetingIntelligenceService.analyze(meeting);
@@ -907,7 +916,12 @@ app.post("/api/meetings/:id/intelligence", requireTrustedOrigin, requireAuth, re
         model: result.model,
         result
       });
-      return response.json({ intelligence: await personalizedIntelligenceFor(request.auth.user, intelligence), cached: false });
+      const updatedMeeting = await meetingStore.get(meeting.id, request.auth.organization.id);
+      return response.json({
+        intelligence: await personalizedIntelligenceFor(request.auth.user, intelligence),
+        meeting: updatedMeeting,
+        cached: false
+      });
     } catch (error) {
       console.error("Meeting intelligence failed:", error);
       return response.status(error?.name === "AbortError" ? 504 : 502).json({

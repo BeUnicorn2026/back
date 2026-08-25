@@ -44,6 +44,7 @@ test("persists and isolates organization meetings", async () => {
   });
   assert.equal(intelligence.source, "local");
   assert.equal((await store.getIntelligence(meeting.id, "org-a", hash)).title, "분석");
+  assert.equal((await store.get(meeting.id, "org-a")).title, "분석");
   assert.equal(await store.getIntelligence(meeting.id, "org-b", hash), null);
   assert.equal(await store.getIntelligence(meeting.id, "org-a", "changed"), null);
   assert.equal(await store.remove(meeting.id, "org-b"), false);
