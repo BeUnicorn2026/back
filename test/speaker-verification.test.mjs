@@ -14,7 +14,9 @@ test("fingerprints canonical PCM and records only an independent probe once", ()
     independentRecording: true, expectedSpeakerId: "speaker-a", predictedSpeakerId: "speaker-a"
   });
   assert.equal(first.recorded, true);
+  assert.equal(first.attemptRecorded, true);
   assert.equal(first.changes.crossSessionVerificationCount, 1);
+  assert.equal(first.changes.verificationAttemptCount, 1);
   assert.equal(first.changes.averageVerificationScore, 0.81);
 
   const duplicate = speakerVerificationUpdate({
@@ -35,10 +37,16 @@ test("does not treat enrollment audio or legacy profiles as independent verifica
 });
 
 test("requires the declared speaker to match the model decision", () => {
+  const speaker = { enrollmentFingerprints: ["enrollment"] };
   const evidence = { fingerprint: "probe", independentRecording: true };
   assert.equal(speakerVerificationUpdate({}, evidence).reason, "expected_not_selected");
-  assert.equal(speakerVerificationUpdate({}, { ...evidence, expectedSpeakerId: "speaker-a" }).reason, "expected_not_matched");
-  assert.equal(speakerVerificationUpdate({}, {
+  const rejected = speakerVerificationUpdate(speaker, { ...evidence, expectedSpeakerId: "speaker-a" });
+  assert.equal(rejected.reason, "expected_not_matched");
+  assert.equal(rejected.attemptRecorded, true);
+  assert.equal(rejected.changes.verificationFailureCount, 1);
+  const wrong = speakerVerificationUpdate(speaker, {
     ...evidence, expectedSpeakerId: "speaker-a", predictedSpeakerId: "speaker-b"
-  }).reason, "unexpected_identity");
+  });
+  assert.equal(wrong.reason, "unexpected_identity");
+  assert.equal(wrong.changes.lastVerificationOutcome, "misidentified");
 });

@@ -996,7 +996,7 @@ app.post("/api/speakers/identify", requireTrustedOrigin, requireAuth, requireOrg
         predictedSpeakerId: decision.identity?.id || ""
       });
       let speakerProfile = null;
-      if (verification.recorded) {
+      if (verification.changes) {
         speakerProfile = publicSpeakerProfile(await speakerStore.updateMetadata(
           expectedSpeaker.id,
           request.auth.organization.id,
@@ -1007,8 +1007,8 @@ app.post("/api/speakers/identify", requireTrustedOrigin, requireAuth, requireOrg
         independent_probe: "등록과 다른 음성으로 실사용 검증을 기록했습니다.",
         not_confirmed: "식별 결과만 확인했습니다. 별도 녹음 확인을 선택하지 않아 검증 횟수에는 반영하지 않았습니다.",
         expected_not_selected: "실제 화자를 선택하지 않아 검증 횟수에는 반영하지 않았습니다.",
-        expected_not_matched: "선택한 실제 화자를 모델이 확정하지 못해 성공 검증으로 기록하지 않았습니다.",
-        unexpected_identity: "모델 판정과 선택한 실제 화자가 달라 성공 검증으로 기록하지 않았습니다.",
+        expected_not_matched: "선택한 실제 화자를 모델이 확정하지 못한 실패 시도를 기록했습니다. 다른 환경의 샘플을 추가해 주세요.",
+        unexpected_identity: "모델 판정과 선택한 실제 화자가 달랐던 실패 시도를 기록했습니다. 프로필 구분도를 점검해 주세요.",
         enrollment_audio: "등록에 사용한 동일 음성이라 별도 환경 검증에는 반영하지 않았습니다.",
         duplicate_probe: "이미 검증한 동일 음성이라 검증 횟수를 늘리지 않았습니다.",
         needs_new_enrollment: "기존 프로필에는 등록 파일 지문이 없어 새 샘플을 추가한 뒤 별도 음성으로 다시 검증해 주세요.",
@@ -1028,6 +1028,7 @@ app.post("/api/speakers/identify", requireTrustedOrigin, requireAuth, requireOrg
         quality,
         verification: {
           recorded: verification.recorded,
+          attemptRecorded: verification.attemptRecorded,
           reason: verification.reason,
           message: verificationMessages[verification.reason]
         },
