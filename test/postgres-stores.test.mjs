@@ -72,7 +72,7 @@ test("PostgreSQL meeting store persists segments and isolates organizations", as
       status: "completed",
       duration: 3.4,
       segments: [
-        { speaker: "민수", known: true, corrected: true, sourceSpeaker: "0", start: 0, end: 3.4, text: " 실제 회의를 저장합니다. " },
+        { speaker: "민수", known: true, corrected: true, transcriptCorrected: true, transcriptConfidence: 0.84, sourceSpeaker: "0", start: 0, end: 3.4, text: " 실제 회의를 저장합니다. " },
         { text: " " }
       ]
     });
@@ -80,7 +80,9 @@ test("PostgreSQL meeting store persists segments and isolates organizations", as
     assert.equal(updated.segmentCount, 1);
     assert.equal(updated.status, "completed");
     assert.equal(updated.segments[0].corrected, true);
+    assert.equal(updated.segments[0].transcriptCorrected, true);
     assert.equal(updated.segments[0].confidence, null);
+    assert.equal(updated.segments[0].transcriptConfidence, 0.84);
     assert.equal((await store.list("org-a")).length, 1);
     assert.equal((await store.list("org-b")).length, 0);
     assert.equal(await store.get(meeting.id, "org-b"), null);

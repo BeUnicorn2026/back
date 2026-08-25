@@ -166,3 +166,13 @@ test("creates a speaker-free segment for isolated STT testing", () => {
     start: 0.2, end: 1.1, text: "안녕 하세요."
   }]);
 });
+
+test("keeps STT confidence separate from speaker similarity", () => {
+  const segments = wordsToSegments([
+    { start: 0, end: 0.5, word: "정확도", confidence: 0.9, speaker: 0 },
+    { start: 0.6, end: 1, word: "확인", confidence: 0.7, speaker: 0 }
+  ], [{ start: 0, end: 1, sourceSpeaker: "0", scores: [0.86] }], [{ id: "one", name: "민수" }]);
+  assert.equal(segments[0].confidence, 0.86);
+  assert.equal(segments[0].transcriptConfidence, 0.8);
+  assert.equal("transcriptConfidenceTotal" in segments[0], false);
+});
