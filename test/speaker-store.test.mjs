@@ -56,6 +56,34 @@ test("updates verification metadata without rewriting biometric payloads", async
   assert.deepEqual(loaded.referenceAudio, Buffer.from("reference"));
 });
 
+test("loads exact profiles without organization scans and enforces explicit immutable ownership", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-partition-exact-speakers-"));
+  const store = new SpeakerStore(root, { encryptionKey: randomBytes(32).toString("base64") });
+  await store.save(metadata(), Buffer.from(new Float32Array([1, 0]).buffer), Buffer.from("reference"));
+  await store.save({ ...metadata("legacy"), createdBy: undefined }, Buffer.alloc(8), Buffer.from("legacy"));
+
+  const originalList = store.list.bind(store);
+  store.list = async () => { throw new Error("bulk scan must not run"); };
+  assert.equal((await store.get("speaker-a", "org")).id, "speaker-a");
+  assert.equal(await store.get("speaker-a", "other-org"), null);
+  await assert.rejects(() => store.get("../speaker-a"), /안전하지 않은/);
+  assert.deepEqual(Array.from((await store.loadProfile("speaker-a", "org")).profile), [1, 0]);
+  assert.equal(await store.loadOwnedProfile("speaker-a", "other-user"), null);
+  assert.equal(await store.updateMetadataOwned("legacy", "user", { name: "claimed" }), null);
+  assert.equal(await store.removeOwned("legacy", "user"), false);
+  store.list = originalList;
+
+  const replaced = await store.replace(
+    { ...metadata(), organizationId: "attacker-org", createdBy: "attacker", createdAt: "later" },
+    Buffer.from(new Float32Array([0, 1]).buffer), Buffer.from("new"), "org"
+  );
+  assert.equal(replaced.organizationId, "org");
+  assert.equal(replaced.createdBy, "user");
+  assert.equal(replaced.createdAt, metadata().createdAt);
+  assert.equal(await store.removeOwned("speaker-a", "other-user"), false);
+  assert.equal(await store.removeOwned("speaker-a", "user"), true);
+});
+
 test("keeps development compatibility but rejects plaintext in production mode", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "voice-partition-plain-speakers-"));
   const plainStore = new SpeakerStore(root);

@@ -72,6 +72,76 @@ test("sanitizes meeting updates and preserves explicit titles", async () => {
   assert.equal(updated.segments[0].speaker, "미등록 화자");
 });
 
+test("reuses an active room meeting and appends accepted segments monotonically", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-partition-meetings-"));
+  const store = new MeetingStore(root);
+  const roomId = "00000000-0000-4000-8000-000000000001";
+  const first = await store.create({ organizationId: "org", createdBy: "user", roomId });
+  const replay = await store.create({ organizationId: "org", createdBy: "user", roomId, title: "ignored" });
+  assert.equal(replay.id, first.id);
+  const one = await store.appendAcceptedSegment(first.id, "org", {
+    userId: "user", speakerProfileId: "profile", speaker: "민수", start: 0, end: 1, text: "첫 구간"
+  });
+  const two = await store.appendAcceptedSegment(first.id, "org", {
+    userId: null, speakerProfileId: null, speaker: "미상", start: 1, end: 2, text: "둘째 구간"
+  });
+  assert.equal(one.sequence, 0);
+  assert.equal(two.sequence, 1);
+  const loaded = await store.get(first.id, "org");
+  assert.equal(loaded.roomId, roomId);
+  assert.deepEqual(loaded.segments.map(({ sequence }) => sequence), [0, 1]);
+  assert.equal(loaded.segments[0].userId, "user");
+  assert.equal(loaded.segments[0].speakerProfileId, "profile");
+
+  const unsafeAutosave = await store.update(first.id, "org", {
+    duration: 9,
+    segments: [{ speaker: "공격자", start: 0, end: 9, text: "전체 대화 덮어쓰기" }]
+  });
+  assert.equal(unsafeAutosave.duration, 9);
+  assert.deepEqual(unsafeAutosave.segments.map(({ text }) => text), ["첫 구간", "둘째 구간"]);
+});
+
+test("room close durably completes its active meeting and binding cannot race afterward", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-partition-meetings-"));
+  const databasePath = path.join(root, "shared.sqlite");
+  const { RoomStore } = await import("../lib/room-store.mjs");
+  const { AuthStore } = await import("../lib/auth-store.mjs");
+  const authStore = new AuthStore(root, { databasePath, verificationSecret: "test-secret" });
+  await authStore.initialize();
+  const user = await authStore.signup({
+    email: "owner@example.com", name: "Owner", password: "secure-pass", introduction: "Test owner"
+  });
+  const { organization } = await authStore.createOrganization(user.id, { name: "Org", domain: "example.com" });
+  const roomStore = new RoomStore(root, {
+    databasePath,
+    uuidFactory: () => "00000000-0000-4000-8000-000000000001",
+    accessCodeFactory: () => "VP-0123456789AB"
+  });
+  const meetingStore = new MeetingStore(root, { databasePath });
+  await Promise.all([roomStore.initialize(), meetingStore.initialize()]);
+  const room = await roomStore.create({
+    organizationId: organization.id, createdBy: user.id, room: "AB12", idempotencyKey: "close-test"
+  });
+  const meeting = await meetingStore.bindRoomMeeting({
+    organizationId: organization.id, createdBy: user.id, roomId: room.id, title: room.room
+  });
+  await meetingStore.appendAcceptedSegment(meeting.id, organization.id, {
+    speaker: "Owner", start: 1, end: 4.5, text: "persisted"
+  });
+
+  const closed = await roomStore.close(room.id, organization.id, user.id);
+  const replay = await roomStore.close(room.id, organization.id, user.id);
+  assert.equal(closed.status, "closed");
+  assert.equal(replay.closedAt, closed.closedAt);
+  const completed = await meetingStore.get(meeting.id, organization.id);
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.duration, 4.5);
+  assert.ok(completed.endedAt);
+  assert.equal(await meetingStore.bindRoomMeeting({
+    organizationId: organization.id, createdBy: user.id, roomId: room.id
+  }), null);
+});
+
 test("creates a completed upload and its segments atomically", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "voice-partition-meetings-"));
   const store = new MeetingStore(root);

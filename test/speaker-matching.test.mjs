@@ -8,7 +8,46 @@ import { assessNewSpeakerSeparation, assessSpeakerProfileExtension, cosineSimila
 const speakers = [{ id: "one", name: "민수" }, { id: "two", name: "지수" }];
 
 test("accepts a registered speaker above threshold and margin", () => {
-  assert.deepEqual(chooseKnownSpeaker([0.91, 0.32], speakers), { id: "one", name: "민수", score: 0.91 });
+  assert.deepEqual(chooseKnownSpeaker([0.91, 0.32], speakers), {
+    id: "one", speakerProfileId: "one", name: "민수", score: 0.91
+  });
+});
+
+test("preserves immutable speaker profile ownership through decisions and tracking", () => {
+  const ownedSpeakers = [
+    { id: "profile-one", name: "민수", createdBy: "user-one" },
+    { id: "profile-two", name: "지수", createdBy: "user-two" }
+  ];
+  const decision = speakerDecision([0.94, 0.2], ownedSpeakers);
+  assert.deepEqual(decision.identity, {
+    id: "profile-one",
+    speakerProfileId: "profile-one",
+    name: "민수",
+    createdBy: "user-one",
+    userId: "user-one",
+    score: 0.94
+  });
+
+  const tracker = new SpeakerIdentityTracker();
+  assert.deepEqual(tracker.identify(0, [0.94, 0.2], ownedSpeakers), decision.identity);
+  assert.deepEqual(tracker.current(0), decision.identity);
+  const [resolved] = wordsToSegments(
+    [{ start: 3, end: 4, word: "소유발화", speaker: 0 }],
+    [],
+    ownedSpeakers,
+    { tracker }
+  );
+  assert.equal(resolved.userId, "user-one");
+  assert.equal(resolved.speakerProfileId, "profile-one");
+  assert.deepEqual(tracker.correct(0, ownedSpeakers[1]), {
+    id: "profile-two",
+    speakerProfileId: "profile-two",
+    name: "지수",
+    createdBy: "user-two",
+    userId: "user-two",
+    score: null,
+    manual: true
+  });
 });
 
 test("rejects ambiguous and low-scoring voices", () => {

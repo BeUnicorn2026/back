@@ -87,6 +87,46 @@ test("switches Blob profile versions after a complete replacement", async () => 
   assert.deepEqual(loaded.referenceAudio, Buffer.from("new-reference"));
 });
 
+test("Blob replacement retries and surfaces obsolete biometric cleanup failure", async () => {
+  const client = memoryBlobClient();
+  const store = new BlobSpeakerStore({ token: "test-token", encryptionKey: randomBytes(32).toString("base64"), client });
+  await store.save(metadata, Buffer.from(new Float32Array([1, 0]).buffer), Buffer.from("old"));
+  let deleteCalls = 0;
+  client.del = async () => { deleteCalls += 1; throw new Error("cleanup unavailable"); };
+  await assert.rejects(() => store.replace(
+    metadata, Buffer.from(new Float32Array([0, 1]).buffer), Buffer.from("new"), "org-a"
+  ), (error) => error.code === "OBSOLETE_BIOMETRIC_CLEANUP_FAILED");
+  assert.equal(deleteCalls, 3);
+  assert.deepEqual(Array.from((await store.loadProfile(metadata.id, "org-a")).profile), [0, 1]);
+});
+
+test("Blob exact lookup avoids bulk listing and exact-owner operations reject missing ownership", async () => {
+  const client = memoryBlobClient();
+  const store = new BlobSpeakerStore({ token: "test-token", encryptionKey: randomBytes(32).toString("base64"), client });
+  await store.save(metadata, Buffer.from(new Float32Array([1, 0]).buffer), Buffer.from("reference"));
+  await store.save({ ...metadata, id: "legacy", createdBy: undefined }, Buffer.alloc(8), Buffer.from("legacy"));
+
+  const originalList = client.list;
+  client.list = async () => { throw new Error("bulk list must not run"); };
+  assert.equal((await store.get(metadata.id, "org-a")).id, metadata.id);
+  assert.equal(await store.get(metadata.id, "org-b"), null);
+  assert.deepEqual(Array.from((await store.loadProfile(metadata.id, "org-a")).profile), [1, 0]);
+  assert.equal(await store.loadOwnedProfile(metadata.id, "user-b"), null);
+  assert.equal(await store.updateMetadataOwned("legacy", "user-a", { name: "claimed" }), null);
+  assert.equal(await store.removeOwned("legacy", "user-a"), false);
+  client.list = originalList;
+
+  const replaced = await store.replace(
+    { ...metadata, organizationId: "org-b", createdBy: "user-b", createdAt: "later" },
+    Buffer.from(new Float32Array([0, 1]).buffer), Buffer.from("new"), "org-a"
+  );
+  assert.equal(replaced.organizationId, "org-a");
+  assert.equal(replaced.createdBy, "user-a");
+  assert.equal(replaced.createdAt, metadata.createdAt);
+  assert.equal(await store.removeOwned(metadata.id, "user-b"), false);
+  assert.equal(await store.removeOwned(metadata.id, "user-a"), true);
+});
+
 test("updates Blob verification metadata without changing payload versions", async () => {
   const client = memoryBlobClient();
   const store = new BlobSpeakerStore({ token: "test-token", encryptionKey: randomBytes(32).toString("base64"), client });

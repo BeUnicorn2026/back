@@ -7,10 +7,10 @@ The migration is incremental so active meeting capture and saved documents remai
 - Bounded asynchronous work queue with graceful shutdown
 - `POST /api/ai/meetmap/jobs`
 - `GET /api/ai/meetmap/jobs/{id}`
-- OpenRouter Chat Completions client using `stealth/ox-alpha`
-- Deterministic local fallback when `OPENROUTER_API_KEY` is absent
+- OpenRouter Chat Completions client using only `stealth/ox-alpha`, strict named JSON schemas, low reasoning effort, and one bounded retry for 429/5xx or invalid output
+- Explicit deterministic local mode only when `OPENROUTER_API_KEY` is absent; configured-provider failures surface without local fallback
 - MeetMap validation for topic chunks, dialogue tags, six-word summaries, unique transcript evidence, and one earlier parent per node
-- Liveness, readiness, CORS, request-size limits, and optional bearer-token protection
+- Liveness, readiness, CORS, an absolute 1 MiB limit on every AI JSON POST body, and fail-closed bearer-token protection
 - Tenant-scoped forwarding through the existing Node session and CSRF boundary
 - A production Compose service that keeps the Go API private on the application network
 

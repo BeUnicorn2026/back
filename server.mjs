@@ -23,6 +23,23 @@ import { BlobSpeakerStore } from "./lib/blob-speaker-store.mjs";
 import { PostgresDatabase, closePostgresDatabases } from "./lib/postgres-database.mjs";
 import { PostgresAuthStore } from "./lib/postgres-auth-store.mjs";
 import { PostgresMeetingStore } from "./lib/postgres-meeting-store.mjs";
+import { RoomStore, RoomStoreError } from "./lib/room-store.mjs";
+import { PostgresRoomStore } from "./lib/postgres-room-store.mjs";
+import { VoiceProfileStore } from "./lib/voice-profile-store.mjs";
+import { PostgresVoiceProfileStore } from "./lib/postgres-voice-profile-store.mjs";
+import {
+  bindRoomMeeting,
+  publicRoom,
+  publishSelfEnrollment,
+  requireCanonicalVoice,
+  requireRoomMember,
+  resolveCanonicalVoice,
+  roomErrorHttpStatus,
+  validateSelfEnrollmentRequest,
+  VoiceProfileError
+} from "./lib/room-server-coordinator.mjs";
+import { handleSelfOnlyRoomLive } from "./lib/room-live-connection.mjs";
+import { RoomLiveHub } from "./lib/room-live-hub.mjs";
 import { PostgresRequestRateLimiter } from "./lib/postgres-rate-limiter.mjs";
 import { MeetingIntelligenceService, transcriptHash } from "./lib/meeting-intelligence.mjs";
 import { PcmHistoryBuffer } from "./lib/pcm-history-buffer.mjs";
@@ -49,6 +66,14 @@ import { publicBillingPlans } from "./lib/billing-plans.mjs";
 import { TossPaymentsClient, TossPaymentsError } from "./lib/toss-payments-client.mjs";
 import { entitlementPeriodStart, meetingAllowance, planEntitlements } from "./lib/plan-entitlements.mjs";
 import { GoMeetMapClient, mergeMeetMapIntelligence } from "./lib/go-meetmap-client.mjs";
+import { MeetMapSubmissionTracker, persistSucceededMeetMapJob } from "./lib/meetmap-submission-tracker.mjs";
+import {
+  filterMeetingsForAccess,
+  MeetingAuthorizationError,
+  requireMeetingAccess
+} from "./lib/meeting-authorization.mjs";
+import { GoLiveMapClient, isLiveMapEnabled } from "./lib/go-livemap-client.mjs";
+import { createLiveMapBridge, createNoopLiveMapBridge } from "./lib/livemap-live-bridge.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 7070;
@@ -91,6 +116,12 @@ const speakerStore = speakerStorageMode === "vercel-blob"
 const meetingStore = postgresDatabase
   ? new PostgresMeetingStore(postgresDatabase)
   : new MeetingStore(path.join(dataDirectory, "meetings"), { databasePath });
+const roomStore = postgresDatabase
+  ? new PostgresRoomStore(postgresDatabase)
+  : new RoomStore(path.join(dataDirectory, "rooms"), { databasePath });
+const voiceProfileStore = postgresDatabase
+  ? new PostgresVoiceProfileStore(postgresDatabase)
+  : new VoiceProfileStore(databasePath);
 const knowledgeStore = postgresDatabase
   ? new PostgresKnowledgeStore(postgresDatabase)
   : new KnowledgeStore(databasePath);
@@ -111,6 +142,11 @@ const meetingIntelligenceService = new MeetingIntelligenceService({
   model: process.env.OPENAI_ANALYSIS_MODEL
 });
 const goMeetMapClient = new GoMeetMapClient({
+  origin: process.env.GO_AI_ORIGIN,
+  token: process.env.AI_API_TOKEN
+});
+const meetMapSubmissions = new MeetMapSubmissionTracker();
+const goLiveMapClient = new GoLiveMapClient({
   origin: process.env.GO_AI_ORIGIN,
   token: process.env.AI_API_TOKEN
 });
@@ -653,7 +689,7 @@ app.post("/api/auth/verify-email", requireTrustedOrigin, verificationRateLimit, 
   const user = await authStore.verifyEmail(request.body?.email, request.body?.code);
   const session = await authStore.createSession(user.id);
   setSessionCookie(request, response, session.token, session.expiresAt);
-  response.json(await authStore.getContextBySession(session.token));
+  response.json({ authenticated: true, ...await authStore.getContextBySession(session.token) });
 });
 
 app.post("/api/auth/verification/resend", requireTrustedOrigin, verificationResendRateLimit, async (request, response) => {
@@ -678,7 +714,7 @@ app.post("/api/auth/login", requireTrustedOrigin, loginRateLimit, async (request
   const user = await authStore.authenticate(request.body?.email, request.body?.password);
   const session = await authStore.createSession(user.id);
   setSessionCookie(request, response, session.token, session.expiresAt);
-  response.json(await authStore.getContextBySession(session.token));
+  response.json({ authenticated: true, ...await authStore.getContextBySession(session.token) });
 });
 
 app.post("/api/auth/logout", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
@@ -774,9 +810,87 @@ app.get("/api/organizations/current/members", requireAuth, requireOrganization, 
   response.json({ organization: request.auth.organization, members });
 });
 
+app.put("/api/profile", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
+  response.json({ authenticated: true, ...await authStore.updateProfile(request.auth.user.id, request.body || {}) });
+});
+
 app.put("/api/profile/vocabulary", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
   response.json(await authStore.updateVocabulary(request.auth.user.id, request.body || {}));
 });
+
+app.get("/api/profile/voice", requireAuth, requireOrganization, async (request, response) => {
+  const resolved = await resolveCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
+  response.json({
+    state: resolved.state,
+    ...(resolved.state === "ready" ? {
+      profile: {
+        speakerProfileId: resolved.profile.speakerProfileId,
+        displayName: resolved.profile.displayName,
+        updatedAt: resolved.pointer.updatedAt
+      }
+    } : {})
+  });
+});
+
+app.post("/api/profile/voice/enroll", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
+  speakerEnrollmentRateLimit, upload.single("audio"), async (request, response) => {
+    validateSelfEnrollmentRequest(request.body || {});
+    if (!request.file) return response.status(400).json({ error: "등록할 음성 파일이 필요합니다.", code: "VOICE_AUDIO_REQUIRED" });
+    const pcm = await decodeToPcm(request.file.buffer, 16);
+    const duration = pcm.length / 2 / speakerModelInfo.sampleRate;
+    if (duration < 10 || duration > 15) {
+      return response.status(400).json({
+        error: "등록 음성은 10초 이상 15초 이하여야 합니다.",
+        code: "VOICE_DURATION_INVALID"
+      });
+    }
+    const samples = new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2));
+    const quality = analyzePcmQuality(samples, speakerModelInfo.sampleRate);
+    if (!quality.usable || !isSpeakerInferenceQuality(quality)) {
+      return response.status(422).json({
+        error: quality.warnings[0] || "등록 음성 품질이 충분하지 않습니다.",
+        code: "VOICE_QUALITY_INVALID",
+        quality
+      });
+    }
+    const profile = await enrollProfile(pcm);
+    const selectedReference = selectSpeakerReferencePcm(samples);
+    const referenceAudio = pcmToWave(Buffer.from(
+      selectedReference.buffer,
+      selectedReference.byteOffset,
+      selectedReference.byteLength
+    ));
+    const enrolledAt = new Date().toISOString();
+    const published = await publishSelfEnrollment({
+      voiceProfileStore,
+      speakerStore,
+      auth: request.auth,
+      profileBuffer: profile.buffer,
+      referenceAudio,
+      metadata: {
+        duration,
+        model: speakerModelInfo.id,
+        profileCount: profile.count,
+        profileDimensions: speakerModelInfo.dimensions,
+        enrollmentConsistency: profile.consistency,
+        matchThreshold: profile.matchThreshold,
+        audioQuality: quality,
+        enrollmentSessionCount: 1,
+        totalEnrollmentDuration: duration,
+        lastEnrolledAt: enrolledAt,
+        enrollmentSessions: [{ duration, qualityScore: quality.score, enrolledAt }],
+        enrollmentFingerprints: [speakerProbeFingerprint(samples)]
+      }
+    });
+    response.status(201).json({
+      state: "ready",
+      profile: {
+        speakerProfileId: published.pointer.speakerProfileId,
+        displayName: request.auth.user.name,
+        updatedAt: published.pointer.updatedAt
+      }
+    });
+  });
 
 app.get("/api/vocabulary/terms", requireAuth, requireOrganization, async (request, response) => {
   const terms = await meetingStore.listVocabularyTerms(
@@ -823,8 +937,7 @@ app.post("/api/knowledge/evidence", requireTrustedOrigin, requireAuth, requireOr
     const meetingId = request.body?.meetingId ? String(request.body.meetingId) : null;
     let segmentIndex = request.body?.segmentIndex == null ? null : Number(request.body.segmentIndex);
     if (meetingId) {
-      const meeting = await meetingStore.get(meetingId, request.auth.organization.id);
-      if (!meeting) return response.status(404).json({ error: "지식 피드백의 회의를 찾지 못했습니다." });
+      const meeting = await requireMeetingAccess({ meetingStore, roomStore, meetingId, auth: request.auth });
       if (segmentIndex != null && (!Number.isInteger(segmentIndex) || segmentIndex < 0 || segmentIndex >= meeting.segments.length)) {
         return response.status(400).json({ error: "지식 피드백의 발화 위치가 올바르지 않습니다." });
       }
@@ -852,8 +965,7 @@ app.post("/api/knowledge/explanations", requireTrustedOrigin, requireAuth, requi
     const requestedTerm = normalizeConceptLabel(request.body?.term);
     const level = ["simple", "standard", "deep"].includes(request.body?.level) ? request.body.level : "simple";
     if (!meetingId || !requestedTerm) return response.status(400).json({ error: "회의와 용어가 필요합니다." });
-    const meeting = await meetingStore.get(meetingId, request.auth.organization.id);
-    if (!meeting) return response.status(404).json({ error: "맞춤 해설의 회의를 찾지 못했습니다." });
+    const meeting = await requireMeetingAccess({ meetingStore, roomStore, meetingId, auth: request.auth });
     const hash = transcriptHash(meeting.segments);
     const intelligence = await meetingStore.getIntelligence(meeting.id, request.auth.organization.id, hash);
     if (!intelligence) return response.status(409).json({ error: "먼저 회의 구조 분석을 완료해 주세요." });
@@ -921,10 +1033,13 @@ app.post("/api/knowledge/explanations/:cacheKey/answer", requireTrustedOrigin, r
     }
     let stored = await knowledgeStore.getExplanation(request.auth.user.id, cacheKey);
     if (!stored) return response.status(404).json({ error: "확인 질문을 찾지 못했습니다." });
-    const meeting = stored.meetingId
-      ? await meetingStore.get(stored.meetingId, request.auth.organization.id)
-      : null;
-    if (!meeting) return response.status(404).json({ error: "확인 질문의 회의를 찾지 못했습니다." });
+    if (!stored.meetingId) return response.status(404).json({ error: "확인 질문의 회의를 찾지 못했습니다." });
+    const meeting = await requireMeetingAccess({
+      meetingStore,
+      roomStore,
+      meetingId: stored.meetingId,
+      auth: request.auth
+    });
     const claimed = await knowledgeStore.claimExplanationAnswer(request.auth.user.id, cacheKey, choiceIndex);
     if (!claimed) stored = await knowledgeStore.getExplanation(request.auth.user.id, cacheKey);
     const recordedChoice = claimed ? choiceIndex : stored.answeredChoiceIndex;
@@ -1019,13 +1134,69 @@ app.get("/api/speakers", requireAuth, requireOrganization, async (request, respo
   response.json({ speakers: (await speakerStore.list(request.auth.organization.id)).map(publicSpeakerProfile) });
 });
 
+app.post("/api/rooms", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
+  await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
+  const room = await roomStore.create({
+    organizationId: request.auth.organization.id,
+    createdBy: request.auth.user.id,
+    room: request.body?.room,
+    idempotencyKey: request.headers["idempotency-key"] || request.body?.idempotencyKey
+  });
+  response.status(201).json({ room: publicRoom(room, { includeAccessCode: true }) });
+});
+
+app.post("/api/rooms/join", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
+  await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
+  const room = await roomStore.join({
+    organizationId: request.auth.organization.id,
+    userId: request.auth.user.id,
+    accessCode: request.body?.accessCode
+  });
+  response.json({ room: publicRoom(room) });
+});
+
+app.get("/api/rooms", requireAuth, requireOrganization, async (request, response) => {
+  const rooms = await roomStore.listForUser(request.auth.user.id, request.auth.organization.id);
+  response.json({ rooms: rooms.map((room) => publicRoom(room)) });
+});
+
+app.get("/api/rooms/:id", requireAuth, requireOrganization, async (request, response) => {
+  const room = await requireRoomMember({ roomStore, roomId: request.params.id, auth: request.auth, requireActive: false });
+  response.json({ room: publicRoom(room) });
+});
+
+app.post("/api/rooms/:id/close", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
+  await requireRoomMember({ roomStore, roomId: request.params.id, auth: request.auth, requireActive: false });
+  const room = await roomStore.close(request.params.id, request.auth.organization.id, request.auth.user.id);
+  await roomLiveHub.closeRoom(room.id);
+  response.json({ room: publicRoom(room) });
+});
+
+app.post("/api/rooms/:id/meetings", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
+  const room = await requireRoomMember({ roomStore, roomId: request.params.id, auth: request.auth });
+  await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
+  const meeting = await bindRoomMeeting({
+    meetingStore,
+    room,
+    auth: request.auth,
+    language: request.body?.language,
+    requestedMeetingId: request.body?.meetingId
+  });
+  response.status(201).json({ meeting });
+});
+
 app.get("/api/meetings", requireAuth, requireOrganization, async (request, response) => {
-  response.json({ meetings: await meetingStore.list(request.auth.organization.id) });
+  const meetings = await meetingStore.list(request.auth.organization.id);
+  response.json({ meetings: await filterMeetingsForAccess({ meetings, roomStore, auth: request.auth }) });
 });
 
 app.get("/api/meetings/:id", requireAuth, requireOrganization, async (request, response) => {
-  const meeting = await meetingStore.get(request.params.id, request.auth.organization.id);
-  if (!meeting) return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
+  const meeting = await requireMeetingAccess({
+    meetingStore,
+    roomStore,
+    meetingId: request.params.id,
+    auth: request.auth
+  });
   response.json({ meeting });
 });
 
@@ -1034,14 +1205,19 @@ app.post("/api/meetmap/jobs", requireTrustedOrigin, requireAuth, requireOrganiza
     const tenantKey = `${request.auth.organization.id}:${request.auth.user.id}`;
     try {
       const meetingId = typeof request.body?.meetingId === "string" ? request.body.meetingId : "";
-      if (meetingId && !await meetingStore.get(meetingId, request.auth.organization.id)) {
-        return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
+      if (meetingId) {
+        await requireMeetingAccess({ meetingStore, roomStore, meetingId, auth: request.auth });
       }
-      const result = await goMeetMapClient.submit({
-        meetingId,
-        segments: Array.isArray(request.body?.segments) ? request.body.segments : [],
-        tenantKey
-      });
+      const segments = Array.isArray(request.body?.segments) ? request.body.segments : [];
+      const result = await goMeetMapClient.submit({ meetingId, segments, tenantKey });
+      if (meetingId && result?.job?.id) {
+        meetMapSubmissions.track(result.job.id, {
+          meetingId,
+          organizationId: request.auth.organization.id,
+          tenantKey,
+          segments
+        });
+      }
       return response.status(202).json(result);
     } catch (error) {
       console.error("Go MeetMap submission failed:", error);
@@ -1053,20 +1229,26 @@ app.get("/api/meetmap/jobs/:id", requireAuth, requireOrganization, async (reques
   const tenantKey = `${request.auth.organization.id}:${request.auth.user.id}`;
   try {
     const result = await goMeetMapClient.get(request.params.id, tenantKey);
-    if (result.job?.status === "succeeded" && result.job.meetingId && result.job.result) {
-      const meeting = await meetingStore.get(result.job.meetingId, request.auth.organization.id);
-      if (meeting && result.job.result.analyzedSegmentCount === meeting.segments.length) {
-        const hash = transcriptHash(meeting.segments);
-        const existing = await meetingStore.getIntelligence(meeting.id, request.auth.organization.id, hash);
-        await meetingStore.saveIntelligence({
-          meetingId: meeting.id,
-          organizationId: request.auth.organization.id,
-          transcriptHash: hash,
-          source: result.job.result.source,
-          model: result.job.result.model,
-          result: mergeMeetMapIntelligence(existing, meeting, result.job.result)
-        });
-      }
+    // Consume tracking for terminal jobs (succeeded/failed) so completed jobs
+    // never leak; persist only when the current transcript still matches what was
+    // submitted for this job id.
+    const trackedSubmission = meetMapSubmissions.peek(request.params.id);
+    if (trackedSubmission?.tenantKey === tenantKey && trackedSubmission.meetingId) {
+      await requireMeetingAccess({
+        meetingStore,
+        roomStore,
+        meetingId: trackedSubmission.meetingId,
+        auth: request.auth
+      });
+    }
+    const submission = meetMapSubmissions.takeTerminal(request.params.id, result.job?.status);
+    if (result.job?.status === "succeeded" && submission?.tenantKey === tenantKey) {
+      await persistSucceededMeetMapJob({
+        job: result.job,
+        submission,
+        organizationId: request.auth.organization.id,
+        meetingStore
+      });
     }
     return response.json(result);
   } catch (error) {
@@ -1075,8 +1257,12 @@ app.get("/api/meetmap/jobs/:id", requireAuth, requireOrganization, async (reques
 });
 
 app.get("/api/meetings/:id/meetmap", requireAuth, requireOrganization, async (request, response) => {
-  const meeting = await meetingStore.get(request.params.id, request.auth.organization.id);
-  if (!meeting) return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
+  const meeting = await requireMeetingAccess({
+    meetingStore,
+    roomStore,
+    meetingId: request.params.id,
+    auth: request.auth
+  });
   const intelligence = await meetingStore.getIntelligence(
     meeting.id,
     request.auth.organization.id,
@@ -1143,22 +1329,62 @@ app.post("/api/meetings/import", requireTrustedOrigin, requireAuth, requireOrgan
   });
 
 app.patch("/api/meetings/:id", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
+  const existing = await requireMeetingAccess({
+    meetingStore,
+    roomStore,
+    meetingId: request.params.id,
+    auth: request.auth
+  });
+  if (existing.roomId && request.body?.segments !== undefined) {
+    throw new MeetingAuthorizationError(
+      "ROOM_TRANSCRIPT_MUTATION_FORBIDDEN",
+      "방 회의의 확정 발화는 전체 대화 업데이트로 변경할 수 없습니다.",
+      409
+    );
+  }
+  const roomLifecycleField = ["status", "startedAt", "endedAt", "roomId", "createdBy"]
+    .find((field) => Object.prototype.hasOwnProperty.call(request.body || {}, field));
+  if (existing.roomId && roomLifecycleField) {
+    throw new MeetingAuthorizationError(
+      "ROOM_MEETING_LIFECYCLE_FORBIDDEN",
+      "방 회의의 진행 상태는 방 수명 주기에 따라 서버에서만 변경됩니다.",
+      409
+    );
+  }
   if (request.body?.duration != null) await requireDurationAllowance(request.auth.organization.id, request.body.duration);
-  const meeting = await meetingStore.update(request.params.id, request.auth.organization.id, request.body || {});
-  if (!meeting) return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
+  const meeting = await meetingStore.update(existing.id, request.auth.organization.id, request.body || {});
   response.json({ meeting });
 });
 
 app.delete("/api/meetings/:id", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
   if (!/^[a-f0-9-]{36}$/i.test(request.params.id)) return response.status(400).json({ error: "잘못된 회의 ID입니다." });
-  const removed = await meetingStore.remove(request.params.id, request.auth.organization.id);
-  if (!removed) return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
+  const meeting = await requireMeetingAccess({
+    meetingStore,
+    roomStore,
+    meetingId: request.params.id,
+    auth: request.auth
+  });
+  if (meeting.roomId) {
+    const room = await roomStore.get(meeting.roomId, request.auth.organization.id);
+    if (!room || room.createdBy !== request.auth.user.id) {
+      throw new MeetingAuthorizationError(
+        "ROOM_MEETING_CREATOR_REQUIRED",
+        "방 회의는 방 생성자만 삭제할 수 있습니다.",
+        403
+      );
+    }
+  }
+  await meetingStore.remove(meeting.id, request.auth.organization.id);
   response.status(204).end();
 });
 
 app.get("/api/meetings/:id/intelligence", requireAuth, requireOrganization, async (request, response) => {
-  const meeting = await meetingStore.get(request.params.id, request.auth.organization.id);
-  if (!meeting) return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
+  const meeting = await requireMeetingAccess({
+    meetingStore,
+    roomStore,
+    meetingId: request.params.id,
+    auth: request.auth
+  });
   const hash = transcriptHash(meeting.segments);
   const intelligence = await meetingStore.getIntelligence(meeting.id, request.auth.organization.id, hash);
   response.json({ intelligence: await personalizedIntelligenceFor(request.auth.user, intelligence) });
@@ -1166,8 +1392,12 @@ app.get("/api/meetings/:id/intelligence", requireAuth, requireOrganization, asyn
 
 app.post("/api/meetings/:id/intelligence", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
   meetingAnalysisRateLimit, async (request, response) => {
-    const meeting = await meetingStore.get(request.params.id, request.auth.organization.id);
-    if (!meeting) return response.status(404).json({ error: "회의 문서를 찾지 못했습니다." });
+    const meeting = await requireMeetingAccess({
+      meetingStore,
+      roomStore,
+      meetingId: request.params.id,
+      auth: request.auth
+    });
     if (!meeting.segments.length) return response.status(409).json({ error: "분석할 실제 발화가 없습니다." });
     const hash = transcriptHash(meeting.segments);
     if (!request.body?.force) {
@@ -1391,7 +1621,7 @@ app.post("/api/speakers/:id/samples", requireTrustedOrigin, requireAuth, require
     const registeredSpeakers = await loadCurrentSpeakerProfiles(request.auth.organization.id);
     const existing = registeredSpeakers.find(({ id }) => id === request.params.id);
     if (!existing) return response.status(404).json({ error: "등록된 목소리를 찾지 못했습니다." });
-    if (existing.createdBy && existing.createdBy !== request.auth.user.id) return response.status(403).json({ error: "본인의 목소리 프로필만 변경할 수 있습니다." });
+    if (!existing.createdBy || existing.createdBy !== request.auth.user.id) return response.status(403).json({ error: "본인의 목소리 프로필만 변경할 수 있습니다." });
     if ((existing.enrollmentSessionCount || 1) >= 8) return response.status(409).json({ error: "한 사람당 최대 8회까지 음성을 추가할 수 있습니다." });
     const pcm = await decodeToPcm(request.file.buffer);
     const duration = pcm.length / 2 / 16_000;
@@ -1431,7 +1661,8 @@ app.post("/api/speakers/:id/samples", requireTrustedOrigin, requireAuth, require
     const referenceAudio = quality.score > (existing.audioQuality?.score || 0)
       ? pcmToWave(Buffer.from(selectedReference.buffer, selectedReference.byteOffset, selectedReference.byteLength))
       : existing.referenceAudio;
-    const storedSpeaker = await speakerStore.replace(updated, profileBuffer, referenceAudio, request.auth.organization.id);
+    const storedSpeaker = await speakerStore.replaceOwned(updated, profileBuffer, referenceAudio, request.auth.user.id);
+    if (!storedSpeaker) return response.status(403).json({ error: "본인의 목소리 프로필만 변경할 수 있습니다." });
     return response.json({ speaker: publicSpeakerProfile(storedSpeaker) });
   } catch (error) {
     console.error("Speaker sample enrollment failed:", error);
@@ -1443,8 +1674,8 @@ app.delete("/api/speakers/:id", requireTrustedOrigin, requireAuth, requireOrgani
   if (!/^[a-f0-9-]{36}$/i.test(request.params.id)) return response.status(400).json({ error: "잘못된 화자 ID입니다." });
   const existing = (await speakerStore.list(request.auth.organization.id)).find(({ id }) => id === request.params.id);
   if (!existing) return response.status(404).json({ error: "등록된 목소리를 찾지 못했습니다." });
-  if (existing.createdBy && existing.createdBy !== request.auth.user.id) return response.status(403).json({ error: "본인의 목소리 프로필만 삭제할 수 있습니다." });
-  const removed = await speakerStore.remove(request.params.id, request.auth.organization.id);
+  if (!existing.createdBy || existing.createdBy !== request.auth.user.id) return response.status(403).json({ error: "본인의 목소리 프로필만 삭제할 수 있습니다." });
+  const removed = await speakerStore.removeOwned(request.params.id, request.auth.user.id);
   if (!removed) return response.status(404).json({ error: "등록된 목소리를 찾지 못했습니다." });
   response.status(204).end();
 });
@@ -1470,6 +1701,9 @@ app.use("/api", (_request, response) => {
 });
 
 app.use((error, _request, response, _next) => {
+  if (error instanceof MeetingAuthorizationError) {
+    return response.status(error.status).json({ error: error.message, code: error.code });
+  }
   if (error instanceof AuthError) {
     return response.status(error.status).json({
       error: error.message,
@@ -1481,9 +1715,11 @@ app.use((error, _request, response, _next) => {
   if (error instanceof EmailDeliveryError) {
     return response.status(502).json({ error: error.message, code: error.code });
   }
-  if (error instanceof BillingError || error instanceof TossPaymentsError) {
+  if (error instanceof BillingError || error instanceof TossPaymentsError || error instanceof VoiceProfileError) {
     return response.status(error.status).json({ error: error.message, code: error.code });
   }
+  const roomStatus = roomErrorHttpStatus(error);
+  if (roomStatus) return response.status(roomStatus).json({ error: error.message, code: error.code });
   if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
     return response.status(413).json({ error: "오디오 파일은 25MB 이하여야 합니다." });
   }
@@ -1492,8 +1728,8 @@ app.use((error, _request, response, _next) => {
 });
 
 await Promise.all([
-  authStore.initialize(), speakerStore.initialize(), meetingStore.initialize(), knowledgeStore.initialize(),
-  billingStore.initialize(), requestRateLimiter.initialize()
+  authStore.initialize(), speakerStore.initialize(), meetingStore.initialize(), roomStore.initialize(),
+  voiceProfileStore.initialize(), knowledgeStore.initialize(), billingStore.initialize(), requestRateLimiter.initialize()
 ]);
 const server = app.listen(port, () => {
   console.log(`Voice Partition is running at http://localhost:${port}`);
@@ -1505,6 +1741,7 @@ if (shouldPreloadSpeakerModel) {
 }
 
 const liveServer = new WebSocketServer({ noServer: true });
+const roomLiveHub = new RoomLiveHub();
 
 server.on("upgrade", (request, socket, head) => {
   const requestUrl = new URL(request.url, `http://${request.headers.host}`);
@@ -1519,6 +1756,90 @@ server.on("upgrade", (request, socket, head) => {
 });
 
 liveServer.on("connection", async (client, request, requestUrl) => {
+  const requestedRoomId = String(requestUrl.searchParams.get("roomId") || "").trim();
+  if (requestedRoomId) {
+    try {
+      if (!process.env.DEEPGRAM_API_KEY) {
+        throw new VoiceProfileError("DEEPGRAM_NOT_CONFIGURED", "DEEPGRAM_API_KEY가 필요합니다.", 503);
+      }
+      const auth = await authStore.getContextBySession(sessionToken(request));
+      if (!auth) throw new VoiceProfileError("UNAUTHENTICATED", "로그인이 필요합니다.", 401);
+      const room = await requireRoomMember({ roomStore, roomId: requestedRoomId, auth });
+      const canonical = await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth });
+      const billingAccess = await requireMeetingAllowance(auth.organization.id);
+      const meeting = await bindRoomMeeting({
+        meetingStore,
+        room,
+        auth,
+        language: requestUrl.searchParams.get("language"),
+        requestedMeetingId: requestUrl.searchParams.get("meetingId") || ""
+      });
+      const hubConnection = await roomLiveHub.acquire({
+        roomId: room.id,
+        meetingId: meeting.id,
+        client,
+        loadPersistedSegments: async () => {
+          const persisted = await meetingStore.get(meeting.id, auth.organization.id);
+          return persisted?.segments || [];
+        },
+        loadRoomStatus: async () => (await roomStore.get(room.id, auth.organization.id))?.status || "closed",
+        loadPersistedLiveMapState: async () => {
+          const persisted = await meetingStore.get(meeting.id, auth.organization.id);
+          if (!persisted) return null;
+          const intelligence = await meetingStore.getIntelligence(
+            persisted.id, auth.organization.id, transcriptHash(persisted.segments)
+          );
+          return intelligence?.meetMap ? { seq: 0, result: intelligence.meetMap } : null;
+        },
+        liveMapClient: goLiveMapClient,
+        liveMapEnabled: isLiveMapEnabled(),
+        tenantKey: `${auth.organization.id}:${room.id}`,
+        pollIntervalMs: Number(process.env.LIVEMAP_POLL_INTERVAL_MS) || 1_000,
+        log: (entry) => console.log(JSON.stringify({ level: "info", ...entry })),
+        persistFinalizedResult: async (liveMapFinal) => {
+          if (!liveMapFinal?.result?.topics?.length) return;
+          const persisted = await meetingStore.get(meeting.id, auth.organization.id);
+          if (!persisted) return;
+          const hash = transcriptHash(persisted.segments);
+          const existing = await meetingStore.getIntelligence(persisted.id, auth.organization.id, hash);
+          const meetMap = { ...liveMapFinal.result, origin: "livemap" };
+          await meetingStore.saveIntelligence({
+            meetingId: persisted.id,
+            organizationId: auth.organization.id,
+            transcriptHash: hash,
+            source: "livemap",
+            model: liveMapFinal.metrics?.model || "livemap",
+            result: mergeMeetMapIntelligence(existing, persisted, meetMap)
+          });
+        }
+      });
+      await handleSelfOnlyRoomLive({
+        client,
+        requestUrl,
+        auth,
+        room,
+        meeting,
+        canonicalProfile: canonical.profile,
+        meetingStore,
+        prepareSpeakerModel,
+        speakerModelInfo,
+        speakerInferenceInfo,
+        maximumAudioBytes: billingAccess.entitlements.meetingDurationSeconds == null
+          ? Number.POSITIVE_INFINITY
+          : billingAccess.entitlements.meetingDurationSeconds * speakerModelInfo.sampleRate * 2,
+        deepgramApiKey: process.env.DEEPGRAM_API_KEY,
+        hubConnection
+      });
+    } catch (error) {
+      const code = error?.code || "ROOM_LIVE_REJECTED";
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: "error", code, message: error.message || "방 연결을 시작하지 못했습니다." }));
+        client.close(code === "UNAUTHENTICATED" ? 1008 : 1011);
+      }
+    }
+    return;
+  }
+
   if (!process.env.DEEPGRAM_API_KEY) {
     client.send(JSON.stringify({ type: "error", message: "DEEPGRAM_API_KEY가 필요합니다." }));
     return client.close(1011);
@@ -1527,6 +1848,11 @@ liveServer.on("connection", async (client, request, requestUrl) => {
   let deepgram;
   let finalizeFallback;
   let providerKeepAlive;
+  // LiveMap bridge lives in the connection-function scope so the close handler
+  // (registered outside the try below) can always dispose it. Defaults to a
+  // no-op so a pre-auth failure never leaves it undefined.
+  let liveMapBridge = createNoopLiveMapBridge();
+  let liveMapMeetingId = null;
   try {
     const auth = await authStore.getContextBySession(sessionToken(request));
     if (!auth) throw new Error("로그인이 필요합니다.");
@@ -1535,6 +1861,19 @@ liveServer.on("connection", async (client, request, requestUrl) => {
     const mode = requestUrl.searchParams.get("mode") === "speaker" ? "speaker" : "stt";
     const speakers = mode === "speaker" ? await loadCurrentSpeakerProfiles(auth.organization.id) : [];
     if (mode === "speaker" && !speakers.length) throw new Error("화자 식별 모드에는 등록 목소리가 한 명 이상 필요합니다.");
+    // Real-time livemap bridge: zero overhead / zero requests when disabled.
+    if (isLiveMapEnabled()) {
+      liveMapBridge = createLiveMapBridge({
+        client: goLiveMapClient,
+        send: (payload) => {
+          if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(payload));
+        },
+        tenantKey: `${auth.organization.id}:${auth.user.id}`,
+        meetingId: null,
+        log: (entry) => console.log(JSON.stringify({ level: "info", ...entry })),
+        pollIntervalMs: Number(process.env.LIVEMAP_POLL_INTERVAL_MS) || 1_000
+      });
+    }
     let preparationTimer = null;
     if (mode === "speaker" && speakerModelState !== "ready" && client.readyState === WebSocket.OPEN) {
       const preparationStartedAt = Date.now();
@@ -1639,7 +1978,40 @@ liveServer.on("connection", async (client, request, requestUrl) => {
       if (finalizationAcknowledged) return;
       finalizationAcknowledged = true;
       clearTimeout(finalizeFallback);
-      transcriptQueue.finally(() => {
+      transcriptQueue.finally(async () => {
+        // Flush the livemap bridge (posts the last turn, finalizes the Go
+        // session). All failure paths return null — never block finalization.
+        let liveMapFinal = null;
+        try {
+          liveMapFinal = await liveMapBridge.finalize();
+        } catch {
+          liveMapFinal = null;
+        }
+        try {
+          if (liveMapFinal?.result?.topics?.length && liveMapMeetingId) {
+            const meetMap = { ...liveMapFinal.result, origin: "livemap" };
+            const meeting = await requireMeetingAccess({
+              meetingStore,
+              roomStore,
+              meetingId: liveMapMeetingId,
+              auth
+            });
+            if (meeting) {
+              const hash = transcriptHash(meeting.segments);
+              const existing = await meetingStore.getIntelligence(meeting.id, auth.organization.id, hash);
+              await meetingStore.saveIntelligence({
+                meetingId: meeting.id,
+                organizationId: auth.organization.id,
+                transcriptHash: hash,
+                source: "livemap",
+                model: liveMapFinal.metrics?.model || "livemap",
+                result: mergeMeetMapIntelligence(existing, meeting, meetMap)
+              });
+            }
+          }
+        } catch (error) {
+          console.error("LiveMap persistence failed:", error);
+        }
         if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: "finalized" }));
       });
     };
@@ -1706,6 +2078,9 @@ liveServer.on("connection", async (client, request, requestUrl) => {
           if (client.readyState === WebSocket.OPEN) {
             client.send(JSON.stringify({ type: "transcript", isFinal: Boolean(event.is_final), speechFinal: Boolean(event.speech_final), segments }));
           }
+          if (event.is_final) {
+            for (const segment of segments) liveMapBridge.handleFinalSegment(segment);
+          }
           const earliestNeeded = Number(event.start ?? 0) - 4;
           while (recognitionFrames.length && recognitionFrames[0].end < earliestNeeded) recognitionFrames.shift();
         }).catch((error) => {
@@ -1738,6 +2113,10 @@ liveServer.on("connection", async (client, request, requestUrl) => {
         try {
           const control = JSON.parse(data.toString());
           if (control.type === "finalize" && !finalizationAcknowledged) {
+            // Optional meetingId lets the livemap tree be persisted at session
+            // end; when absent (current client) the REST meeting-save path owns
+            // MeetMap persistence and this stays null.
+            if (control.meetingId) liveMapMeetingId = String(control.meetingId);
             deepgram.send(JSON.stringify({ type: "Finalize" }));
             finalizeFallback = setTimeout(acknowledgeFinalization, 3_500);
           } else if (control.type === "speakerCorrection" && mode === "speaker" && identityTracker) {
@@ -1801,6 +2180,7 @@ liveServer.on("connection", async (client, request, requestUrl) => {
 
   client.on("close", () => {
     clearTimeout(finalizeFallback);
+    liveMapBridge.dispose();
     providerKeepAlive?.stop();
     if (deepgram?.readyState === WebSocket.OPEN) {
       deepgram.send(JSON.stringify({ type: "CloseStream" }));

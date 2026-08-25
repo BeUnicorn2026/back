@@ -12,22 +12,32 @@ import (
 
 	"github.com/BeUnicorn2026/voice-partition-back/internal/config"
 	"github.com/BeUnicorn2026/voice-partition-back/internal/jobs"
+	"github.com/BeUnicorn2026/voice-partition-back/internal/livemap"
 	"github.com/BeUnicorn2026/voice-partition-back/internal/meetmap"
 )
 
 type Server struct {
-	config config.Config
-	jobs   *jobs.Manager
-	mux    *http.ServeMux
+	config  config.Config
+	jobs    *jobs.Manager
+	liveMgr *livemap.Manager
+	mux     *http.ServeMux
 }
 
-func New(cfg config.Config, manager *jobs.Manager) http.Handler {
-	server := &Server{config: cfg, jobs: manager, mux: http.NewServeMux()}
+func New(cfg config.Config, manager *jobs.Manager, live *livemap.Manager) http.Handler {
+	cfg.MaximumBodyBytes = effectiveMaximumBodyBytes(cfg.MaximumBodyBytes)
+	server := &Server{config: cfg, jobs: manager, liveMgr: live, mux: http.NewServeMux()}
 	server.mux.HandleFunc("GET /api/health/live", server.live)
 	server.mux.HandleFunc("GET /api/health/ready", server.ready)
 	server.mux.HandleFunc("GET /api/health", server.health)
 	server.mux.HandleFunc("POST /api/ai/meetmap/jobs", server.createMeetMapJob)
 	server.mux.HandleFunc("GET /api/ai/meetmap/jobs/{id}", server.getMeetMapJob)
+	if live != nil {
+		server.mux.HandleFunc("POST /api/ai/livemap/sessions", server.createLivemapSession)
+		server.mux.HandleFunc("POST /api/ai/livemap/sessions/{id}/turns", server.appendLivemapTurn)
+		server.mux.HandleFunc("GET /api/ai/livemap/sessions/{id}", server.getLivemapSession)
+		server.mux.HandleFunc("POST /api/ai/livemap/sessions/{id}/finalize", server.finalizeLivemapSession)
+		server.mux.HandleFunc("DELETE /api/ai/livemap/sessions/{id}", server.deleteLivemapSession)
+	}
 	return server.middleware(server.mux)
 }
 
@@ -38,7 +48,7 @@ func (server *Server) middleware(next http.Handler) http.Handler {
 		if server.config.PublicOrigin != "" && request.Header.Get("Origin") == server.config.PublicOrigin {
 			response.Header().Set("Access-Control-Allow-Origin", server.config.PublicOrigin)
 			response.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Voice-Partition-Tenant")
-			response.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			response.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 			response.Header().Set("Vary", "Origin")
 		}
 		if request.Method == http.MethodOptions {
@@ -55,7 +65,7 @@ func (server *Server) middleware(next http.Handler) http.Handler {
 
 func (server *Server) authorized(request *http.Request) bool {
 	if server.config.AIAPIToken == "" {
-		return true
+		return false
 	}
 	provided := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
 	return len(provided) == len(server.config.AIAPIToken) && subtle.ConstantTimeCompare([]byte(provided), []byte(server.config.AIAPIToken)) == 1
@@ -87,21 +97,8 @@ func (server *Server) createMeetMapJob(response http.ResponseWriter, request *ht
 		writeError(response, http.StatusBadRequest, "분석 작업 소유자 정보가 필요합니다")
 		return
 	}
-	request.Body = http.MaxBytesReader(response, request.Body, server.config.MaximumBodyBytes)
-	decoder := json.NewDecoder(request.Body)
-	decoder.DisallowUnknownFields()
 	var input meetmap.Request
-	if err := decoder.Decode(&input); err != nil {
-		status := http.StatusBadRequest
-		var maximum *http.MaxBytesError
-		if errors.As(err, &maximum) {
-			status = http.StatusRequestEntityTooLarge
-		}
-		writeError(response, status, "요청 본문이 올바르지 않습니다")
-		return
-	}
-	if err := ensureEOF(decoder); err != nil {
-		writeError(response, http.StatusBadRequest, "요청 본문에는 JSON 객체 하나만 허용됩니다")
+	if !server.decodeBody(response, request, &input) {
 		return
 	}
 	input.TenantKey = tenantKey
@@ -125,6 +122,13 @@ func (server *Server) getMeetMapJob(response http.ResponseWriter, request *http.
 		return
 	}
 	writeJSON(response, http.StatusOK, map[string]any{"job": job})
+}
+
+func effectiveMaximumBodyBytes(configured int64) int64 {
+	if configured <= 0 || configured > config.MaximumAIRequestBytes {
+		return config.MaximumAIRequestBytes
+	}
+	return configured
 }
 
 func ensureEOF(decoder *json.Decoder) error {

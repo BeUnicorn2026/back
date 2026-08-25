@@ -32,12 +32,16 @@ async function verifiedUser(store, details, now = Date.now()) {
 test("PostgreSQL auth store supports the complete organization onboarding flow", async () => {
   await withDatabase(async (database) => {
     const store = new PostgresAuthStore(database, { verificationSecret: "test-verification-secret" });
-    const owner = await store.signup({ name: "김민지", email: "minji@acme.test", password: "secure-pass" });
+    const owner = await store.signup({ name: "김민지", email: "minji@acme.test", password: "secure-pass", introduction: "  데이터 제품을 기획합니다.  " });
     await assert.rejects(store.authenticate(owner.email, "secure-pass"),
       (error) => error instanceof AuthError && error.code === "EMAIL_NOT_VERIFIED");
     const verification = await store.issueEmailVerification(owner.id, { now: 10_000 });
     await store.verifyEmail(owner.email, verification.code, { now: 10_001 });
-    assert.equal((await store.authenticate("MINJI@acme.test", "secure-pass")).id, owner.id);
+    await assert.rejects(store.verifyEmail(owner.email, verification.code, { now: 10_002 }),
+      (error) => error instanceof AuthError && error.code === "EMAIL_ALREADY_VERIFIED");
+    const authenticated = await store.authenticate("MINJI@acme.test", "secure-pass");
+    assert.equal(authenticated.id, owner.id);
+    assert.equal(authenticated.introduction, "데이터 제품을 기획합니다.");
 
     const session = await store.createSession(owner.id);
     assert.equal((await store.getContextBySession(session.token)).csrfToken, session.csrfToken);
@@ -49,17 +53,32 @@ test("PostgreSQL auth store supports the complete organization onboarding flow",
     assert.deepEqual(onboarded.user.vocabulary.roles, ["기획"]);
 
     const member = await verifiedUser(store,
-      { name: "멤버", email: "member@acme.test", password: "secure-pass" }, 100_000);
+      { name: "멤버", email: "member@acme.test", password: "secure-pass", introduction: "  데이터 제품을 기획합니다.  " }, 100_000);
     const joined = await store.joinOrganization(member.id, ownerContext.organization.inviteCode.toLowerCase());
     assert.equal(joined.organization.id, ownerContext.organization.id);
     assert.equal(joined.membership.role, "member");
-    assert.equal((await store.listMembers(owner.id, ownerContext.organization.id)).length, 2);
+    const members = await store.listMembers(owner.id, ownerContext.organization.id);
+    assert.equal(members.length, 2);
+    assert.ok(members.every((listed) => !("introduction" in listed)));
     assert.equal("passwordHash" in joined.user, false);
 
+    const updated = await store.updateProfile(owner.id, { introduction: "  백엔드 프로필  " });
+    assert.equal(updated.user.introduction, "백엔드 프로필");
+    await assert.rejects(store.updateProfile(owner.id, { introduction: "가".repeat(501) }),
+      (error) => error instanceof AuthError && error.code === "INTRODUCTION_INVALID");
+
     await assert.rejects(
-      store.signup({ name: "중복", email: "MINJI@ACME.TEST", password: "secure-pass" }),
+      store.signup({ name: "중복", email: "MINJI@ACME.TEST", password: "secure-pass", introduction: "  데이터 제품을 기획합니다.  " }),
       (error) => error instanceof AuthError && error.code === "EMAIL_EXISTS"
     );
+    await assert.rejects(
+      store.signup({ name: "소개 없음", email: "empty@acme.test", password: "secure-pass", introduction: "  " }),
+      (error) => error instanceof AuthError && error.code === "INTRODUCTION_INVALID"
+    );
+
+    await database.query("UPDATE users SET introduction = NULL WHERE id = $1", [member.id]);
+    const legacySession = await store.createSession(member.id);
+    assert.equal((await store.getContextBySession(legacySession.token)).user.introduction, null);
   });
 });
 
@@ -109,6 +128,33 @@ test("PostgreSQL meeting store persists segments and isolates organizations", as
     assert.equal(await store.remove(meeting.id, "org-a"), true);
     assert.equal(await store.get(meeting.id, "org-a"), null);
     assert.equal(await store.getIntelligence(meeting.id, "org-a", hash), null);
+  });
+});
+
+test("PostgreSQL meeting store reuses active room meetings and sequences accepted segments", async () => {
+  await withDatabase(async (database) => {
+    const store = new PostgresMeetingStore(database);
+    const roomId = "00000000-0000-4000-8000-000000000001";
+    const first = await store.create({ organizationId: "org", createdBy: "user", roomId });
+    const replay = await store.create({ organizationId: "org", createdBy: "user", roomId });
+    assert.equal(replay.id, first.id);
+    const one = await store.appendAcceptedSegment(first.id, "org", {
+      userId: "user-a", speakerProfileId: "profile-a", start: 0, end: 1, text: "첫 구간"
+    });
+    const two = await store.appendAcceptedSegment(first.id, "org", {
+      userId: null, speakerProfileId: null, start: 1, end: 2, text: "둘째 구간"
+    });
+    assert.deepEqual([one.sequence, two.sequence].sort(), [0, 1]);
+    const loaded = await store.get(first.id, "org");
+    assert.equal(loaded.roomId, roomId);
+    assert.deepEqual(loaded.segments.map(({ sequence }) => sequence), [0, 1]);
+    assert.equal(loaded.segments.find(({ userId }) => userId)?.speakerProfileId, "profile-a");
+    const unsafeAutosave = await store.update(first.id, "org", {
+      duration: 8,
+      segments: [{ speaker: "공격자", start: 0, end: 8, text: "전체 대화 덮어쓰기" }]
+    });
+    assert.equal(unsafeAutosave.duration, 8);
+    assert.deepEqual(unsafeAutosave.segments.map(({ text }) => text), ["첫 구간", "둘째 구간"]);
   });
 });
 

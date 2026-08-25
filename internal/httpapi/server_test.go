@@ -18,7 +18,7 @@ func TestMeetMapJobRunsAsynchronously(t *testing.T) {
 	cfg := config.Config{OpenRouterModel: config.DefaultOpenRouterModel, AIAPIToken: "secret", MaximumBodyBytes: 1 << 20}
 	manager := jobs.New(meetmap.NewOpenRouter("", "", config.DefaultOpenRouterModel, "", time.Second), 1, 4)
 	defer manager.Close()
-	handler := New(cfg, manager)
+	handler := New(cfg, manager, nil)
 	body := `{"meetingId":"meeting-1","segments":[{"speaker":"민수","start":0,"end":2,"text":"어떻게 시작할까요?"},{"speaker":"지수","start":3,"end":5,"text":"작게 시작하는 입장입니다"}]}`
 	request := httptest.NewRequest(http.MethodPost, "/api/ai/meetmap/jobs", bytes.NewBufferString(body))
 	request.Header.Set("Authorization", "Bearer secret")
@@ -58,14 +58,41 @@ func TestMeetMapJobRunsAsynchronously(t *testing.T) {
 	t.Fatal("job did not complete")
 }
 
+func TestAIAPIRoutesFailClosedWithoutConfiguredToken(t *testing.T) {
+	cfg := config.Config{MaximumBodyBytes: 1 << 20}
+	manager := jobs.New(meetmap.NewOpenRouter("", "", config.DefaultOpenRouterModel, "", time.Second), 1, 1)
+	defer manager.Close()
+	request := httptest.NewRequest(http.MethodPost, "/api/ai/meetmap/jobs", strings.NewReader(`{"segments":[]}`))
+	response := httptest.NewRecorder()
+	New(cfg, manager, nil).ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("empty configured token must fail closed with 401, got %d", response.Code)
+	}
+}
+
 func TestMeetMapJobsRequireConfiguredToken(t *testing.T) {
 	cfg := config.Config{AIAPIToken: "secret", MaximumBodyBytes: 1 << 20}
 	manager := jobs.New(meetmap.NewOpenRouter("", "", config.DefaultOpenRouterModel, "", time.Second), 1, 1)
 	defer manager.Close()
 	request := httptest.NewRequest(http.MethodPost, "/api/ai/meetmap/jobs", strings.NewReader(`{"segments":[]}`))
 	response := httptest.NewRecorder()
-	New(cfg, manager).ServeHTTP(response, request)
+	New(cfg, manager, nil).ServeHTTP(response, request)
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", response.Code)
+	}
+}
+
+func TestMeetMapJobRejectsBodyOverAbsoluteOneMiB(t *testing.T) {
+	cfg := config.Config{AIAPIToken: "secret", MaximumBodyBytes: config.MaximumAIRequestBytes * 8}
+	manager := jobs.New(meetmap.NewOpenRouter("", "", config.DefaultOpenRouterModel, "", time.Second), 1, 1)
+	defer manager.Close()
+	body := `{"segments":[],"padding":"` + strings.Repeat("x", int(config.MaximumAIRequestBytes)) + `"}`
+	request := httptest.NewRequest(http.MethodPost, "/api/ai/meetmap/jobs", strings.NewReader(body))
+	request.Header.Set("Authorization", "Bearer secret")
+	request.Header.Set("X-Voice-Partition-Tenant", "tenant")
+	response := httptest.NewRecorder()
+	New(cfg, manager, nil).ServeHTTP(response, request)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized MeetMap body must return 413, got %d: %s", response.Code, response.Body.String())
 	}
 }

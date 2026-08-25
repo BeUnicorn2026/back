@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "properties": {
+    "parent_id": {
+      "anyOf": [{"type": "string"}, {"type": "null"}],
+      "description": "입력 트리에 실존하는 노드 ID, 없으면 null"
+    },
+    "relation": {
+      "anyOf": [
+        {"type": "string", "enum": ["answers", "supports", "objects_to", "elaborates", "follows_up"]},
+        {"type": "null"}
+      ],
+      "description": "parent_id가 null이면 null"
+    },
+    "confidence": {"type": "number", "description": "0.0~1.0"},
+    "reason": {"type": "string", "description": "판단 근거 한 줄"}
+  },
+  "required": ["parent_id", "relation", "confidence", "reason"],
+  "additionalProperties": false
+}

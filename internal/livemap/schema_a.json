@@ -1,0 +1,33 @@
+{
+  "type": "object",
+  "properties": {
+    "topic": {
+      "type": "object",
+      "properties": {
+        "is_new": {"type": "boolean", "description": "직전 턴 대비 새 토픽이 시작되면 true"},
+        "title": {"type": "string", "description": "6어절 이내 토픽 제목"},
+        "off_agenda": {"type": "boolean", "description": "아젠다와 무관한 잡담이면 true"}
+      },
+      "required": ["is_new", "title", "off_agenda"],
+      "additionalProperties": false
+    },
+    "nodes": {
+      "type": "array",
+      "maxItems": 8,
+      "description": "이번 턴에서 생성할 IBIS 노드",
+      "items": {
+        "type": "object",
+        "properties": {
+          "type": {"type": "string", "enum": ["question", "idea", "pro", "con"]},
+          "text": {"type": "string", "description": "5어절·20자 이내 요약"},
+          "quote": {"type": "string", "description": "원문 발화 부분"},
+          "terms": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["type", "text", "quote", "terms"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["topic", "nodes"],
+  "additionalProperties": false
+}

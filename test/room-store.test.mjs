@@ -1,0 +1,125 @@
+import assert from "node:assert/strict";
+import { mkdtemp } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { AuthStore } from "../lib/auth-store.mjs";
+import { RoomStore, RoomStoreError } from "../lib/room-store.mjs";
+
+async function fixture(options = {}) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-partition-rooms-"));
+  const databasePath = path.join(root, "app.sqlite");
+  const auth = new AuthStore(path.join(root, "auth"), {
+    databasePath, verificationSecret: "room-store-test-secret"
+  });
+  const owner = await auth.signup({ name: "owner", email: `${crypto.randomUUID()}@test.dev`, password: "password-1234", introduction: "Room store test user" });
+  const organization = (await auth.createOrganization(owner.id, { name: "Test organization" })).organization;
+  const member = await auth.signup({ name: "member", email: `${crypto.randomUUID()}@test.dev`, password: "password-1234", introduction: "Room store test user" });
+  await auth.joinOrganization(member.id, organization.inviteCode);
+  const outsider = await auth.signup({ name: "outsider", email: `${crypto.randomUUID()}@test.dev`, password: "password-1234", introduction: "Room store test user" });
+  return {
+    auth, owner, member, outsider, organization,
+    store: new RoomStore(root, { databasePath, ...options })
+  };
+}
+
+function hasCode(code) {
+  return (error) => error instanceof RoomStoreError && error.code === code;
+}
+
+test("SQLite room store separates caller room from generated access code", async () => {
+  let factoryCalls = 0;
+  const { store, owner, organization } = await fixture({
+    accessCodeFactory: () => {
+      factoryCalls += 1;
+      return "VP-0123456789AB";
+    }
+  });
+  const room = await store.create({
+    organizationId: organization.id, createdBy: owner.id, room: "A7Z9",
+    accessCode: "VP-CLIENTVALUE0", idempotencyKey: "request-1"
+  });
+  assert.match(room.id, /^[0-9a-f]{8}-[0-9a-f-]{27}$/);
+  assert.equal(room.room, "A7Z9");
+  assert.equal(room.accessCode, "VP-0123456789AB");
+  assert.notEqual(room.room, room.accessCode);
+  assert.equal(factoryCalls, 1);
+  assert.deepEqual((await store.listForUser(owner.id, organization.id)).map(({ id }) => id), [room.id]);
+
+  for (const value of ["a7z9", "ABCDE", "A_79", ""] ) {
+    await assert.rejects(store.create({
+      organizationId: organization.id, createdBy: owner.id, room: value, idempotencyKey: `invalid-${value}`
+    }), hasCode("INVALID_ROOM"));
+  }
+});
+
+test("SQLite room create is idempotent and distinguishes room and access-code collisions", async () => {
+  const codes = ["VP-000000000000", "VP-000000000000", "VP-111111111111"];
+  const { store, owner, organization } = await fixture({ accessCodeFactory: () => codes.shift() });
+  const firstInput = { organizationId: organization.id, createdBy: owner.id, room: "AB12", idempotencyKey: "same" };
+  const first = await store.create(firstInput);
+  const replay = await store.create({ ...firstInput, room: "ZZ99", accessCode: "VP-CLIENTVALUE0" });
+  assert.equal(replay.id, first.id);
+  assert.equal(replay.accessCode, first.accessCode);
+
+  const fetched = await store.get(first.id, organization.id);
+  assert.equal(Object.hasOwn(fetched, "accessCode"), false);
+  assert.equal(Object.hasOwn(await store.getByRoom(first.room, organization.id), "accessCode"), false);
+  assert.equal(Object.hasOwn((await store.listForUser(owner.id, organization.id))[0], "accessCode"), false);
+
+  await assert.rejects(store.create({
+    organizationId: organization.id, createdBy: owner.id, room: "AB12", idempotencyKey: "other"
+  }), hasCode("ROOM_EXISTS"));
+  const retried = await store.create({
+    organizationId: organization.id, createdBy: owner.id, room: "CD34", idempotencyKey: "third"
+  });
+  assert.equal(retried.accessCode, "VP-111111111111");
+
+  const exhausted = await fixture({ accessCodeFactory: () => "VP-000000000000", collisionRetries: 2 });
+  await exhausted.store.create({
+    organizationId: exhausted.organization.id, createdBy: exhausted.owner.id, room: "EF56", idempotencyKey: "one"
+  });
+  await assert.rejects(exhausted.store.create({
+    organizationId: exhausted.organization.id, createdBy: exhausted.owner.id, room: "GH78", idempotencyKey: "two"
+  }), hasCode("ACCESS_CODE_EXHAUSTED"));
+});
+
+test("SQLite room joins are organization-isolated and never grant organization membership", async () => {
+  const { auth, store, owner, member, outsider, organization } = await fixture();
+  const room = await store.create({
+    organizationId: organization.id, createdBy: owner.id, room: "J9K8", idempotencyKey: "joinable"
+  });
+  assert.equal(await store.get(room.id, "another-org"), null);
+  assert.equal(await store.getByRoom(room.room, "another-org"), null);
+  await assert.rejects(store.join({
+    organizationId: organization.id, userId: outsider.id, accessCode: room.accessCode
+  }), hasCode("ORGANIZATION_MEMBERSHIP_REQUIRED"));
+  assert.equal((await auth.listMembers(owner.id, organization.id)).length, 2);
+
+  const joined = await store.join({
+    organizationId: organization.id, userId: member.id, accessCode: room.accessCode
+  });
+  assert.equal(joined.id, room.id);
+  assert.equal(Object.hasOwn(joined, "accessCode"), false);
+  await assert.rejects(store.join({
+    organizationId: organization.id, userId: member.id, accessCode: room.accessCode
+  }), hasCode("ALREADY_JOINED"));
+  await assert.rejects(store.join({
+    organizationId: organization.id, userId: member.id, accessCode: "VP-ZZZZZZZZZZZZ"
+  }), hasCode("ROOM_NOT_FOUND"));
+
+  const closeOnly = await store.create({
+    organizationId: organization.id, createdBy: owner.id, room: "L7M6", idempotencyKey: "close-only"
+  });
+  await store.close(closeOnly.id, organization.id, owner.id);
+  await assert.rejects(store.join({
+    organizationId: organization.id, userId: member.id, accessCode: closeOnly.accessCode
+  }), hasCode("ROOM_CLOSED"));
+  const closed = await store.close(room.id, organization.id, owner.id);
+  assert.equal(closed.status, "closed");
+  assert.equal(Object.hasOwn(closed, "accessCode"), false);
+  const reused = await store.create({
+    organizationId: organization.id, createdBy: owner.id, room: room.room, idempotencyKey: "reuse"
+  });
+  assert.notEqual(reused.id, room.id);
+});

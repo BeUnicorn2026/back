@@ -57,6 +57,7 @@ test("imports legacy auth and meeting JSON once without modifying the source fil
 
     const context = await authStore.getContextBySession(sessionToken);
     assert.equal(context.user.name, "기존 사용자");
+    assert.equal(context.user.introduction, null);
     assert.equal(context.organization.id, "org-legacy");
     assert.deepEqual(context.user.vocabulary.knownTerms, ["VAD"]);
     const meetings = await meetingStore.list("org-legacy");

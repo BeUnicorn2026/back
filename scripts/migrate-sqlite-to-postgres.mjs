@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { PostgresAuthStore } from "../lib/postgres-auth-store.mjs";
 import { closePostgresDatabases, PostgresDatabase } from "../lib/postgres-database.mjs";
 import { PostgresMeetingStore } from "../lib/postgres-meeting-store.mjs";
+import { PostgresRoomStore } from "../lib/postgres-room-store.mjs";
 import { PostgresRequestRateLimiter } from "../lib/postgres-rate-limiter.mjs";
 
 const args = process.argv.slice(2);
@@ -40,7 +41,7 @@ await stat(sourcePath).catch(() => {
 const source = new DatabaseSync(sourcePath, { readOnly: true });
 const tableNames = [
   "users", "organizations", "memberships", "sessions", "email_verifications",
-  "meetings", "meeting_segments", "meeting_intelligence", "request_rate_limits"
+  "rooms", "room_memberships", "meetings", "meeting_segments", "meeting_intelligence", "request_rate_limits"
 ];
 
 function sourceRows(table) {
@@ -68,6 +69,7 @@ try {
   await new PostgresAuthStore(target, {
     verificationSecret: process.env.EMAIL_VERIFICATION_SECRET || "migration-schema-initialization-secret"
   }).initialize();
+  await new PostgresRoomStore(target).initialize();
   await new PostgresMeetingStore(target).initialize();
   await new PostgresRequestRateLimiter(target).initialize();
 
@@ -83,10 +85,10 @@ try {
   await target.transaction(async (client) => {
     for (const row of snapshot.users) {
       await client.query(`INSERT INTO users
-        (id, name, email, password_hash, active_organization_id, roles_json, known_terms_json,
+        (id, name, email, password_hash, introduction, active_organization_id, roles_json, known_terms_json,
           onboarded_at, email_verified_at, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10, $11)`,
-      [row.id, row.name, row.email, row.password_hash, row.active_organization_id,
+        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10, $11, $12)`,
+      [row.id, row.name, row.email, row.password_hash, row.introduction ?? null, row.active_organization_id,
         row.roles_json || "[]", row.known_terms_json || "[]", row.onboarded_at,
         row.email_verified_at, row.created_at, row.updated_at]);
     }
@@ -109,19 +111,37 @@ try {
         VALUES ($1, $2, $3, $4, $5, $6)`,
       [row.user_id, row.code_hash, row.expires_at, row.attempt_count, row.last_sent_at, row.created_at]);
     }
+    for (const row of snapshot.rooms) {
+      await client.query(`INSERT INTO rooms
+        (id, room, access_code, organization_id, created_by, status, idempotency_key,
+          created_at, updated_at, closed_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [row.id, row.room, row.access_code, row.organization_id, row.created_by, row.status,
+        row.idempotency_key, row.created_at, row.updated_at, row.closed_at]);
+    }
+    for (const row of snapshot.room_memberships) {
+      await client.query(`INSERT INTO room_memberships
+        (room_id, organization_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4, $5)`,
+      [row.room_id, row.organization_id, row.user_id, row.role, row.joined_at]);
+    }
     for (const row of snapshot.meetings) {
       await client.query(`INSERT INTO meetings
-        (id, organization_id, created_by, title, language, source, mode, status, duration, started_at, ended_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-      [row.id, row.organization_id, row.created_by, row.title, row.language, row.source,
-        row.mode, row.status, row.duration, row.started_at, row.ended_at, row.updated_at]);
+        (id, organization_id, created_by, room_id, title, language, source, mode, status,
+          duration, started_at, ended_at, updated_at, import_key)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+      [row.id, row.organization_id, row.created_by, row.room_id ?? null, row.title, row.language,
+        row.source, row.mode, row.status, row.duration, row.started_at, row.ended_at,
+        row.updated_at, row.import_key ?? null]);
     }
     for (const row of snapshot.meeting_segments) {
       await client.query(`INSERT INTO meeting_segments
-        (meeting_id, position, id, speaker, known, corrected, confidence, source_speaker, start, "end", text)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-      [row.meeting_id, row.position, row.id, row.speaker, Boolean(row.known), Boolean(row.corrected), row.confidence,
-        row.source_speaker, row.start, row.end, row.text]);
+        (meeting_id, position, id, speaker, known, corrected, transcript_corrected, confidence,
+          transcript_confidence, source_speaker, user_id, speaker_profile_id, sequence, start, "end", text)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+      [row.meeting_id, row.position, row.id, row.speaker, Boolean(row.known), Boolean(row.corrected),
+        Boolean(row.transcript_corrected), row.confidence, row.transcript_confidence ?? null,
+        row.source_speaker, row.user_id ?? null, row.speaker_profile_id ?? null,
+        row.sequence ?? row.position, row.start, row.end, row.text]);
     }
     for (const row of snapshot.meeting_intelligence) {
       await client.query(`INSERT INTO meeting_intelligence

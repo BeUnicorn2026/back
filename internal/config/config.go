@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-const DefaultOpenRouterModel = "stealth/ox-alpha"
+const (
+	DefaultOpenRouterModel = "stealth/ox-alpha"
+	MaximumAIRequestBytes  = int64(1 << 20)
+)
 
 type Config struct {
 	Host              string
@@ -18,6 +21,7 @@ type Config struct {
 	OpenRouterBaseURL string
 	OpenRouterModel   string
 	OpenRouterTimeout time.Duration
+	LivemapModel      string
 	AIAPIToken        string
 	WorkerCount       int
 	QueueSize         int
@@ -36,8 +40,11 @@ func Load() (Config, error) {
 		AIAPIToken:        strings.TrimSpace(os.Getenv("AI_API_TOKEN")),
 		WorkerCount:       integer("AI_WORKER_COUNT", 4),
 		QueueSize:         integer("AI_QUEUE_SIZE", 64),
-		MaximumBodyBytes:  int64(integer("AI_MAXIMUM_BODY_BYTES", 1<<20)),
+		MaximumBodyBytes:  maximumBodyBytes(),
 	}
+	// LIVEMAP_MODEL falls back to the shared OpenRouter model when unset so the
+	// live tree and batch MeetMap default to the same model.
+	cfg.LivemapModel = value("LIVEMAP_MODEL", cfg.OpenRouterModel)
 	if cfg.Port < 1 || cfg.Port > 65535 {
 		return Config{}, fmt.Errorf("GO_PORT must be between 1 and 65535")
 	}
@@ -46,6 +53,9 @@ func Load() (Config, error) {
 	}
 	if cfg.QueueSize < cfg.WorkerCount || cfg.QueueSize > 4096 {
 		return Config{}, fmt.Errorf("AI_QUEUE_SIZE must be between AI_WORKER_COUNT and 4096")
+	}
+	if cfg.AIAPIToken == "" {
+		return Config{}, fmt.Errorf("AI_API_TOKEN must be configured")
 	}
 	return cfg, nil
 }
@@ -67,4 +77,12 @@ func integer(name string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func maximumBodyBytes() int64 {
+	configured := int64(integer("AI_MAXIMUM_BODY_BYTES", int(MaximumAIRequestBytes)))
+	if configured <= 0 || configured > MaximumAIRequestBytes {
+		return MaximumAIRequestBytes
+	}
+	return configured
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/BeUnicorn2026/voice-partition-back/internal/config"
 	"github.com/BeUnicorn2026/voice-partition-back/internal/httpapi"
 	"github.com/BeUnicorn2026/voice-partition-back/internal/jobs"
+	"github.com/BeUnicorn2026/voice-partition-back/internal/livemap"
 	"github.com/BeUnicorn2026/voice-partition-back/internal/meetmap"
 )
 
@@ -26,7 +27,9 @@ func main() {
 	analyzer := meetmap.NewOpenRouter(cfg.OpenRouterAPIKey, cfg.OpenRouterBaseURL, cfg.OpenRouterModel, cfg.PublicOrigin, cfg.OpenRouterTimeout)
 	manager := jobs.New(analyzer, cfg.WorkerCount, cfg.QueueSize)
 	defer manager.Close()
-	httpServer := httpapi.HTTPServer(fmt.Sprintf("%s:%d", cfg.Host, cfg.Port), httpapi.New(cfg, manager))
+	liveManager := livemap.NewManager(livemap.NewCaller(cfg.OpenRouterAPIKey, cfg.OpenRouterBaseURL, cfg.LivemapModel, cfg.PublicOrigin), livemap.ManagerOptions{})
+	defer liveManager.Close()
+	httpServer := httpapi.HTTPServer(fmt.Sprintf("%s:%d", cfg.Host, cfg.Port), httpapi.New(cfg, manager, liveManager))
 	go func() {
 		slog.Info("Go migration API listening", "address", httpServer.Addr, "model", cfg.OpenRouterModel, "openrouter", cfg.OpenRouterAPIKey != "")
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

@@ -23,12 +23,13 @@ async function verifyNewUser(store, user, now = Date.now()) {
 
 test("signup, session, organization creation and vocabulary persist", async () => {
   await withStore(async (store) => {
-    const user = await store.signup({ name: "김민지", email: "minji@example.com", password: "secure-pass" });
+    const user = await store.signup({ name: "김민지", email: "minji@example.com", password: "secure-pass", introduction: "  회의 제품을 기획합니다.  " });
     await assert.rejects(store.authenticate("minji@example.com", "secure-pass"),
       (error) => error instanceof AuthError && error.code === "EMAIL_NOT_VERIFIED");
     await verifyNewUser(store, user);
     const authenticated = await store.authenticate("MINJI@example.com", "secure-pass");
     assert.equal(authenticated.id, user.id);
+    assert.equal(authenticated.introduction, "회의 제품을 기획합니다.");
 
     const session = await store.createSession(user.id);
     const sessionContext = await store.getContextBySession(session.token);
@@ -50,22 +51,25 @@ test("signup, session, organization creation and vocabulary persist", async () =
 
 test("invite code joins a second user without exposing password hashes", async () => {
   await withStore(async (store) => {
-    const owner = await store.signup({ name: "오너", email: "owner@acme.test", password: "secure-pass" });
+    const owner = await store.signup({ name: "오너", email: "owner@acme.test", password: "secure-pass", introduction: "  회의 제품을 기획합니다.  " });
     await verifyNewUser(store, owner);
     const created = await store.createOrganization(owner.id, { name: "Acme", domain: "acme.test" });
-    const member = await store.signup({ name: "멤버", email: "member@acme.test", password: "secure-pass" });
+    const member = await store.signup({ name: "멤버", email: "member@acme.test", password: "secure-pass", introduction: "  회의 제품을 기획합니다.  " });
     await verifyNewUser(store, member);
     const joined = await store.joinOrganization(member.id, created.organization.inviteCode.toLowerCase());
     assert.equal(joined.organization.id, created.organization.id);
     assert.equal(joined.membership.role, "member");
     assert.equal("passwordHash" in joined.user, false);
-    assert.equal((await store.listMembers(owner.id, created.organization.id)).length, 2);
+    assert.equal(joined.user.introduction, "회의 제품을 기획합니다.");
+    const members = await store.listMembers(owner.id, created.organization.id);
+    assert.equal(members.length, 2);
+    assert.ok(members.every((listed) => !("introduction" in listed)));
   });
 });
 
 test("verification codes expire, limit guesses and can be replaced", async () => {
   await withStore(async (store) => {
-    const user = await store.signup({ name: "검증 사용자", email: "verify@example.com", password: "secure-pass" });
+    const user = await store.signup({ name: "검증 사용자", email: "verify@example.com", password: "secure-pass", introduction: "  회의 제품을 기획합니다.  " });
     const first = await store.issueEmailVerification(user.id, { now: 10_000 });
     await assert.rejects(store.issueEmailVerification(user.id, { now: 20_000 }),
       (error) => error instanceof AuthError && error.code === "VERIFICATION_COOLDOWN");
@@ -85,11 +89,41 @@ test("verification codes expire, limit guesses and can be replaced", async () =>
   });
 });
 
+test("verified email cannot create a fresh session through verification", async () => {
+  await withStore(async (store) => {
+    const user = await store.signup({
+      name: "인증 사용자", email: "verified@example.com", password: "secure-pass", introduction: "보안 테스트"
+    });
+    const verification = await verifyNewUser(store, user, 10_000);
+    await assert.rejects(store.verifyEmail(user.email, verification.code, { now: 10_002 }),
+      (error) => error instanceof AuthError && error.status === 409 && error.code === "EMAIL_ALREADY_VERIFIED");
+  });
+});
+
+test("signup introduction is required, profile updates are trimmed, and legacy null remains readable", async () => {
+  await withStore(async (store) => {
+    for (const introduction of [undefined, "   ", "가".repeat(501)]) {
+      await assert.rejects(
+        store.signup({ name: "소개 검증", email: `intro-${String(introduction).length}@example.com`, password: "secure-pass", introduction }),
+        (error) => error instanceof AuthError && error.code === "INTRODUCTION_INVALID"
+      );
+    }
+
+    const user = await store.signup({
+      name: "소개 사용자", email: "introduction@example.com", password: "secure-pass", introduction: "첫 소개"
+    });
+    const updated = await store.updateProfile(user.id, { introduction: "  갱신한 소개  " });
+    assert.equal(updated.user.introduction, "갱신한 소개");
+    await assert.rejects(store.updateProfile(user.id, { introduction: "  " }),
+      (error) => error instanceof AuthError && error.code === "INTRODUCTION_INVALID");
+  });
+});
+
 test("duplicate email and invalid password are rejected", async () => {
   await withStore(async (store) => {
-    await store.signup({ name: "사용자", email: "user@example.com", password: "secure-pass" });
+    await store.signup({ name: "사용자", email: "user@example.com", password: "secure-pass", introduction: "  회의 제품을 기획합니다.  " });
     await assert.rejects(
-      store.signup({ name: "다른 사용자", email: "USER@example.com", password: "secure-pass" }),
+      store.signup({ name: "다른 사용자", email: "USER@example.com", password: "secure-pass", introduction: "  회의 제품을 기획합니다.  " }),
       (error) => error instanceof AuthError && error.status === 409
     );
     await assert.rejects(
