@@ -8,6 +8,8 @@
     "dev": "NODE_ENV=development node server.mjs",
     "start": "NODE_ENV=production node server.mjs",
     "test": "node --test test/*.test.mjs",
+    "go:dev": "GOCACHE=/private/tmp/voice-partition-go-cache go run ./cmd/server",
+    "go:test": "GOCACHE=/private/tmp/voice-partition-go-cache go test ./...",
     "test:live-stt": "node scripts/test-live-stt.mjs",
     "benchmark:speakers": "node scripts/benchmark-speakers.mjs",
     "migrate:speaker-encryption": "node scripts/migrate-speaker-encryption.mjs",
