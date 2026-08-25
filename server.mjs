@@ -33,7 +33,7 @@ import { KnowledgeExplanationService, knowledgeExplanationCacheKey } from "./lib
 import { normalizeUploadFilename, uploadTitle } from "./lib/upload-filename.mjs";
 import { productionEnvironmentIssues, serviceReadiness } from "./lib/service-readiness.mjs";
 import { createConcurrencyLimit } from "./lib/concurrency-limit.mjs";
-import { speakerProbeFingerprint, speakerVerificationUpdate } from "./lib/speaker-verification.mjs";
+import { recordingEnvelopeSimilarity, speakerProbeFingerprint, speakerVerificationUpdate } from "./lib/speaker-verification.mjs";
 
 const app = express();
 const port = Number(process.env.PORT) || 3001;
@@ -994,13 +994,30 @@ app.post("/api/speakers/identify", requireTrustedOrigin, requireAuth, requireOrg
       const expectedSpeakerId = String(request.body?.expectedSpeakerId || "").trim();
       const expectedSpeaker = expectedSpeakerId ? speakers.find(({ id }) => id === expectedSpeakerId) : null;
       if (expectedSpeakerId && !expectedSpeaker) return response.status(400).json({ error: "검증 대상 화자를 찾지 못했습니다." });
+      const enrollmentAudioThreshold = Number(process.env.SPEAKER_DUPLICATE_AUDIO_THRESHOLD) || 0.985;
+      let enrollmentAudioSimilarity = null;
+      if (request.body?.independentRecording === "true" && expectedSpeaker?.referenceAudio) {
+        try {
+          const referencePcm = await decodeToPcm(expectedSpeaker.referenceAudio);
+          const referenceSamples = new Int16Array(
+            referencePcm.buffer,
+            referencePcm.byteOffset,
+            Math.floor(referencePcm.byteLength / 2)
+          );
+          enrollmentAudioSimilarity = recordingEnvelopeSimilarity(samples, referenceSamples);
+        } catch (error) {
+          console.error("Enrollment audio similarity check failed:", error);
+        }
+      }
       const verification = speakerVerificationUpdate(expectedSpeaker, {
         fingerprint: speakerProbeFingerprint(samples),
         score: decision.bestScore,
         qualityScore: quality.score,
         independentRecording: request.body?.independentRecording === "true",
         expectedSpeakerId,
-        predictedSpeakerId: decision.identity?.id || ""
+        predictedSpeakerId: decision.identity?.id || "",
+        enrollmentAudioSimilarity,
+        enrollmentAudioThreshold
       });
       let speakerProfile = null;
       if (verification.changes) {
@@ -1016,7 +1033,7 @@ app.post("/api/speakers/identify", requireTrustedOrigin, requireAuth, requireOrg
         expected_not_selected: "실제 화자를 선택하지 않아 검증 횟수에는 반영하지 않았습니다.",
         expected_not_matched: "선택한 실제 화자를 모델이 확정하지 못한 실패 시도를 기록했습니다. 다른 환경의 샘플을 추가해 주세요.",
         unexpected_identity: "모델 판정과 선택한 실제 화자가 달랐던 실패 시도를 기록했습니다. 프로필 구분도를 점검해 주세요.",
-        enrollment_audio: "등록에 사용한 동일 음성이라 별도 환경 검증에는 반영하지 않았습니다.",
+        enrollment_audio: "등록 음성과 동일하거나 재인코딩한 파일이라 별도 환경 검증에는 반영하지 않았습니다.",
         duplicate_probe: "이미 검증한 동일 음성이라 검증 횟수를 늘리지 않았습니다.",
         needs_new_enrollment: "기존 프로필에는 등록 파일 지문이 없어 새 샘플을 추가한 뒤 별도 음성으로 다시 검증해 주세요.",
         not_matched: "이름이 확정되지 않아 검증 기록을 변경하지 않았습니다."
@@ -1037,7 +1054,11 @@ app.post("/api/speakers/identify", requireTrustedOrigin, requireAuth, requireOrg
           recorded: verification.recorded,
           attemptRecorded: verification.attemptRecorded,
           reason: verification.reason,
-          message: verificationMessages[verification.reason]
+          message: verificationMessages[verification.reason],
+          ...(enrollmentAudioSimilarity == null ? {} : {
+            enrollmentAudioSimilarity,
+            enrollmentAudioThreshold
+          })
         },
         speakerProfile
       });

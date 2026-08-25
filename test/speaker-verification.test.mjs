@@ -1,6 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { speakerProbeFingerprint, speakerVerificationUpdate } from "../lib/speaker-verification.mjs";
+import { recordingEnvelopeSimilarity, speakerProbeFingerprint, speakerVerificationUpdate } from "../lib/speaker-verification.mjs";
+
+function patternedPcm(seconds = 6, sampleRate = 16_000) {
+  const pcm = new Int16Array(seconds * sampleRate);
+  for (let index = 0; index < pcm.length; index += 1) {
+    const envelope = 0.2 + 0.7 * Math.abs(Math.sin(index / 7_913) * Math.cos(index / 3_277));
+    pcm[index] = Math.round(Math.sin(index / 11.3) * envelope * 12_000);
+  }
+  return pcm;
+}
+
+test("detects the same recording after gain and codec-like quantization", () => {
+  const original = patternedPcm();
+  const transformed = Int16Array.from(original, (sample) => Math.round(sample * 0.72 / 32) * 32);
+  const different = Int16Array.from(original, (_sample, index) =>
+    Math.round(Math.sin(index / 17.7) * (0.2 + 0.7 * Math.abs(Math.sin(index / 1_931))) * 12_000));
+  assert.ok(recordingEnvelopeSimilarity(original, transformed) > 0.99);
+  assert.ok(recordingEnvelopeSimilarity(original, different) < 0.8);
+  assert.equal(recordingEnvelopeSimilarity(original.subarray(0, 16_000), transformed), null);
+});
 
 test("fingerprints canonical PCM and records only an independent probe once", () => {
   const enrollment = new Int16Array([1, 2, 3, 4]);
@@ -33,6 +52,9 @@ test("does not treat enrollment audio or legacy profiles as independent verifica
   assert.equal(speakerVerificationUpdate({ enrollmentFingerprints: [fingerprint] }, { fingerprint }).reason, "not_confirmed");
   const identity = { independentRecording: true, expectedSpeakerId: "speaker-a", predictedSpeakerId: "speaker-a" };
   assert.equal(speakerVerificationUpdate({ enrollmentFingerprints: [fingerprint] }, { fingerprint, ...identity }).reason, "enrollment_audio");
+  assert.equal(speakerVerificationUpdate({ enrollmentFingerprints: [fingerprint] }, {
+    fingerprint: "recoded", enrollmentAudioSimilarity: 0.998, ...identity
+  }).reason, "enrollment_audio");
   assert.equal(speakerVerificationUpdate({}, { fingerprint, ...identity }).reason, "needs_new_enrollment");
 });
 

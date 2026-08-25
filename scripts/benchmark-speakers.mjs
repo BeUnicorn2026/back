@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { analyzePcmQuality } from "../lib/audio-quality.mjs";
 import { getSpeakerEmbeddingModel, mergeSpeakerProfileVectors, speakerInferenceInfo } from "../lib/speaker-embedding-model.mjs";
 import { assessBenchmarkCoverage, calibrateSpeakerThreshold, evaluateSpeakerTrials } from "../lib/speaker-evaluation.mjs";
+import { recordingEnvelopeSimilarity } from "../lib/speaker-verification.mjs";
 
 const argumentsList = process.argv.slice(2);
 const valueAfter = (name) => {
@@ -23,10 +24,12 @@ Manifest:
     { "file": "audio/unknown.wav", "speakerId": null }
   ],
   "threshold": 0.72,
-  "margin": 0.04
+  "margin": 0.04,
+  "duplicateAudioThreshold": 0.985
 }
 
-Enrollment and probe files must be different recordings. Paths are resolved relative to the manifest.`);
+Enrollment and probe files must be independent recordings. Re-encoded or edited copies are rejected.
+Paths are resolved relative to the manifest.`);
   process.exit(0);
 }
 
@@ -66,6 +69,7 @@ const model = await getSpeakerEmbeddingModel(
 const speakers = [];
 const enrollmentQuality = [];
 const enrollmentFiles = new Set();
+const enrollmentRecordings = [];
 for (const speaker of manifest.speakers) {
   if (!speaker.id || !speaker.name || !Array.isArray(speaker.enrollment) || !speaker.enrollment.length) {
     throw new Error("각 speaker에는 id, name, enrollment 파일 목록이 필요합니다.");
@@ -75,6 +79,7 @@ for (const speaker of manifest.speakers) {
     const file = path.resolve(manifestDirectory, relativeFile);
     enrollmentFiles.add(file);
     const pcm = await decodeToPcm(file);
+    enrollmentRecordings.push({ file: relativeFile, pcm });
     const quality = analyzePcmQuality(pcm);
     if (!quality.usable) throw new Error(`${relativeFile}: ${quality.warnings[0] || "등록 품질 부족"}`);
     const profile = await model.createProfile(pcm);
@@ -100,6 +105,15 @@ for (const probe of manifest.probes) {
     throw new Error(`${probe.file}: speakerId ${probe.speakerId}가 speakers에 없습니다.`);
   }
   const pcm = await decodeToPcm(file);
+  const duplicateAudioThreshold = Number(manifest.duplicateAudioThreshold) || 0.985;
+  const duplicateEnrollment = enrollmentRecordings.map((enrollment) => ({
+    file: enrollment.file,
+    similarity: recordingEnvelopeSimilarity(pcm, enrollment.pcm)
+  })).filter(({ similarity }) => similarity != null)
+    .sort((left, right) => right.similarity - left.similarity)[0];
+  if (duplicateEnrollment?.similarity >= duplicateAudioThreshold) {
+    throw new Error(`${probe.file}: ${duplicateEnrollment.file} 등록 음성의 재인코딩 또는 편집본으로 보입니다. 독립 녹음을 사용해 주세요.`);
+  }
   const quality = analyzePcmQuality(pcm);
   const scores = await model.compare(pcm, speakers.map(({ profiles }) => profiles), { maximumEmbeddings: 3 });
   if (!scores) throw new Error(`${probe.file}: 말소리가 부족해 비교하지 못했습니다.`);
