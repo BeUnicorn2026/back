@@ -64,7 +64,29 @@ test("OpenAI structured analysis is grounded and remains shared across user prof
   assert.deepEqual(result.terms.map(({ term }) => term), ["VAD", "임베딩"]);
   assert.equal(result.terms[0].firstSeenAt, 1);
   assert.equal(result.actions[0].firstSeenAt, 4);
+  assert.equal(result.actions[0].text, "민수가 내일까지 검증 결과를 확인해 주세요.");
+  assert.equal(result.actions[0].owner, "민수");
+  assert.equal(result.actions[0].due, "내일까지");
   assert.equal(result.source, "openai");
+});
+
+test("OpenAI cannot invent action text, ownership or deadlines", async () => {
+  const service = new MeetingIntelligenceService({
+    apiKey: "test-key",
+    fetch: async () => new Response(JSON.stringify({
+      output: [{ type: "message", content: [{ type: "output_text", text: JSON.stringify({
+        title: "검증", summary: "검증", topics: [], terms: [],
+        actions: [{ text: "배포를 완료한다", owner: "없는 사람", due: "내일", evidenceSegmentIndex: 0 }]
+      }) }] }]
+    }), { status: 200, headers: { "Content-Type": "application/json" } })
+  });
+  const result = await service.analyze({
+    segments: [{ speaker: "지수", start: 0, end: 2, text: "결과를 확인해 주세요." }]
+  });
+  assert.deepEqual(result.actions[0], {
+    id: "action-0-0", text: "결과를 확인해 주세요.", owner: "담당 미정", due: "일정 미정",
+    evidenceSegmentIndex: 0, firstSeenAt: 0
+  });
 });
 
 test("transcript hash changes when the persisted transcript changes", () => {
