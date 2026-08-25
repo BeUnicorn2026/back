@@ -338,13 +338,36 @@ async function billingSnapshot(organizationId, now = new Date()) {
   const subscription = await billingStore.subscriptionForOrganization(organizationId, now);
   const entitlements = planEntitlements(subscription);
   const periodStart = entitlementPeriodStart(subscription, now);
-  const usedMeetings = await meetingStore.countSince(organizationId, periodStart);
+  const persistedMeetings = await meetingStore.countSince(organizationId, periodStart);
+  const usedMeetings = await billingStore.meetingUsageForPeriod({
+    organizationId,
+    periodStart,
+    baselineUsed: persistedMeetings,
+    now
+  });
   return {
     subscription,
     entitlements,
     periodStart,
     meetingUsage: meetingAllowance(entitlements, usedMeetings)
   };
+}
+
+async function reserveMeetingAllowance(organizationId, usageKey, now = new Date()) {
+  const snapshot = await billingSnapshot(organizationId, now);
+  const reservation = await billingStore.consumeMeeting({
+    organizationId,
+    periodStart: snapshot.periodStart,
+    limit: snapshot.entitlements.meetingsPerPeriod,
+    usageKey,
+    baselineUsed: snapshot.meetingUsage.used,
+    now
+  });
+  return { ...snapshot, reservation };
+}
+
+async function releaseMeetingAllowance(organizationId, periodStart, usageKey) {
+  await billingStore.releaseMeeting({ organizationId, periodStart, usageKey });
 }
 
 async function requireMeetingAllowance(organizationId) {
@@ -1000,29 +1023,38 @@ app.get("/api/meetings/:id", requireAuth, requireOrganization, async (request, r
 });
 
 app.post("/api/meetings", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
-  await requireMeetingAllowance(request.auth.organization.id);
-  const meeting = await meetingStore.create({
-    organizationId: request.auth.organization.id,
-    createdBy: request.auth.user.id,
-    language: request.body?.language,
-    source: request.body?.source,
-    mode: request.body?.mode,
-    title: request.body?.title
-  });
-  response.status(201).json({ meeting });
+  const organizationId = request.auth.organization.id;
+  const usageKey = `meeting:${randomUUID()}`;
+  const access = await reserveMeetingAllowance(organizationId, usageKey);
+  try {
+    const meeting = await meetingStore.create({
+      organizationId,
+      createdBy: request.auth.user.id,
+      language: request.body?.language,
+      source: request.body?.source,
+      mode: request.body?.mode,
+      title: request.body?.title
+    });
+    response.status(201).json({ meeting });
+  } catch (error) {
+    await releaseMeetingAllowance(organizationId, access.periodStart, usageKey);
+    throw error;
+  }
 });
 
 app.post("/api/meetings/import", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
   transcriptionRateLimit, transcriptionConcurrencyLimit, upload.single("audio"), async (request, response) => {
     if (!request.file) return response.status(400).json({ error: "지원되는 오디오 파일이 필요합니다." });
+    let usageReservation = null;
     try {
       const language = typeof request.body?.language === "string" ? request.body.language.trim() : "";
       const importKey = typeof request.body?.importId === "string" ? request.body.importId.trim() : "";
       if (!/^[a-f0-9-]{36}$/i.test(importKey)) return response.status(400).json({ error: "유효한 업로드 ID가 필요합니다." });
       const existing = await meetingStore.getByImportKey(request.auth.organization.id, importKey);
       if (existing) return response.json({ meeting: existing, duplicate: true });
-      await requireMeetingAllowance(request.auth.organization.id);
       if (!process.env.OPENAI_API_KEY) return response.status(503).json({ error: "OPENAI_API_KEY가 설정되지 않았습니다." });
+      const usageKey = `import:${importKey}`;
+      usageReservation = { usageKey, ...await reserveMeetingAllowance(request.auth.organization.id, usageKey) };
       const transcription = await transcribeAudioFile(request.file, language, request.auth.organization.id);
       if (!transcription.segments?.length) return response.status(422).json({ error: "인식된 대화가 없습니다." });
       await requireDurationAllowance(request.auth.organization.id, transcription.duration);
@@ -1039,6 +1071,9 @@ app.post("/api/meetings/import", requireTrustedOrigin, requireAuth, requireOrgan
       });
       return response.status(201).json({ meeting });
     } catch (error) {
+      if (usageReservation && !usageReservation.reservation.duplicate) {
+        await releaseMeetingAllowance(request.auth.organization.id, usageReservation.periodStart, usageReservation.usageKey);
+      }
       if (error instanceof BillingError) throw error;
       return transcriptionErrorResponse(error, response);
     }

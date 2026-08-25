@@ -57,3 +57,30 @@ test("expired paid subscriptions safely fall back to Free", async () => {
     planId: "FREE", status: "ACTIVE", currentPeriodStart: null, currentPeriodEnd: null, orderId: null
   });
 });
+
+test("meeting usage is atomic, idempotent, and is not reduced by document deletion", async () => {
+  const store = await fixture();
+  const periodStart = "2026-08-01T00:00:00.000Z";
+  const parameters = { organizationId: "org-1", periodStart, limit: 2, baselineUsed: 0 };
+  const first = await store.consumeMeeting({ ...parameters, usageKey: "meeting-a" });
+  const duplicate = await store.consumeMeeting({ ...parameters, usageKey: "meeting-a" });
+  const second = await store.consumeMeeting({ ...parameters, usageKey: "meeting-b" });
+  assert.deepEqual(first, { used: 1, duplicate: false });
+  assert.deepEqual(duplicate, { used: 1, duplicate: true });
+  assert.equal(second.used, 2);
+  await assert.rejects(store.consumeMeeting({ ...parameters, usageKey: "meeting-c" }),
+    (error) => error instanceof BillingError && error.code === "PLAN_MEETING_LIMIT");
+  assert.equal(await store.meetingUsageForPeriod({ ...parameters, baselineUsed: 0 }), 2);
+});
+
+test("failed meeting persistence releases only its own reserved usage", async () => {
+  const store = await fixture();
+  const parameters = {
+    organizationId: "org-1", periodStart: "2026-08-01T00:00:00.000Z", limit: 1,
+    baselineUsed: 0, usageKey: "meeting-failed"
+  };
+  await store.consumeMeeting(parameters);
+  assert.equal(await store.releaseMeeting(parameters), true);
+  assert.equal(await store.releaseMeeting(parameters), false);
+  assert.deepEqual(await store.consumeMeeting({ ...parameters, usageKey: "meeting-retry" }), { used: 1, duplicate: false });
+});

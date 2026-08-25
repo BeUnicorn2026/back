@@ -7,6 +7,7 @@ import { PostgresDatabase } from "../lib/postgres-database.mjs";
 import { PostgresMeetingStore } from "../lib/postgres-meeting-store.mjs";
 import { PostgresKnowledgeStore } from "../lib/postgres-knowledge-store.mjs";
 import { PostgresRequestRateLimiter } from "../lib/postgres-rate-limiter.mjs";
+import { PostgresBillingStore } from "../lib/postgres-billing-store.mjs";
 import { transcriptHash } from "../lib/meeting-intelligence.mjs";
 
 async function withDatabase(run) {
@@ -142,6 +143,27 @@ test("PostgreSQL rate limiter shares an atomic fixed window", async () => {
     assert.equal(attempts.filter(({ allowed }) => allowed).length, 5);
     assert.equal(Math.min(...attempts.map(({ remaining }) => remaining)), 0);
     assert.equal((await limiter.consume("login:address:user", { limit: 5, windowMs: 1_000, now: 11_001 })).allowed, true);
+  });
+});
+
+test("PostgreSQL billing store reserves meeting quota atomically", async () => {
+  await withDatabase(async (database) => {
+    await database.query("CREATE TABLE users (id TEXT PRIMARY KEY); CREATE TABLE organizations (id TEXT PRIMARY KEY)");
+    await database.query("INSERT INTO users (id) VALUES ('user-a'); INSERT INTO organizations (id) VALUES ('org-a')");
+    const store = new PostgresBillingStore(database);
+    const parameters = {
+      organizationId: "org-a", periodStart: "2026-08-01T00:00:00.000Z", limit: 2, baselineUsed: 0
+    };
+    const results = await Promise.all([
+      store.consumeMeeting({ ...parameters, usageKey: "meeting-a" }),
+      store.consumeMeeting({ ...parameters, usageKey: "meeting-b" })
+    ]);
+    assert.deepEqual(results.map(({ used }) => used).sort(), [1, 2]);
+    assert.equal((await store.consumeMeeting({ ...parameters, usageKey: "meeting-a" })).duplicate, true);
+    await assert.rejects(store.consumeMeeting({ ...parameters, usageKey: "meeting-c" }),
+      (error) => error.code === "PLAN_MEETING_LIMIT");
+    assert.equal(await store.releaseMeeting({ ...parameters, usageKey: "meeting-b" }), true);
+    assert.equal((await store.consumeMeeting({ ...parameters, usageKey: "meeting-c" })).used, 2);
   });
 });
 
