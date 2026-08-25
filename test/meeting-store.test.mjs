@@ -63,6 +63,7 @@ test("creates a completed upload and its segments atomically", async () => {
 
   const meeting = await store.createCompleted({
     organizationId: "org", createdBy: "user", language: "ko", title: "인터뷰.wav",
+    importKey: "9aebfbe1-6436-4996-8ee5-46ff80ade67d",
     segments: [{ speaker: "민수", known: true, start: 1, end: 4.2, text: "파일 전사 결과입니다." }]
   });
   assert.equal(meeting.status, "completed");
@@ -70,4 +71,12 @@ test("creates a completed upload and its segments atomically", async () => {
   assert.equal(meeting.duration, 4.2);
   assert.equal(meeting.segmentCount, 1);
   assert.equal((await store.get(meeting.id, "org")).segments[0].text, "파일 전사 결과입니다.");
+  const duplicate = await store.createCompleted({
+    organizationId: "org", createdBy: "user", importKey: "9aebfbe1-6436-4996-8ee5-46ff80ade67d",
+    segments: [{ text: "중복 전사는 저장하지 않습니다." }]
+  });
+  assert.equal(duplicate.id, meeting.id);
+  assert.equal((await store.list("org")).length, 1);
+  assert.equal((await store.getByImportKey("org", "9aebfbe1-6436-4996-8ee5-46ff80ade67d")).id, meeting.id);
+  assert.equal(await store.getByImportKey("other-org", "9aebfbe1-6436-4996-8ee5-46ff80ade67d"), null);
 });

@@ -801,10 +801,14 @@ app.post("/api/meetings", requireTrustedOrigin, requireAuth, requireOrganization
 
 app.post("/api/meetings/import", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
   transcriptionRateLimit, upload.single("audio"), async (request, response) => {
-    if (!process.env.OPENAI_API_KEY) return response.status(503).json({ error: "OPENAI_API_KEY가 설정되지 않았습니다." });
     if (!request.file) return response.status(400).json({ error: "지원되는 오디오 파일이 필요합니다." });
     try {
       const language = typeof request.body?.language === "string" ? request.body.language.trim() : "";
+      const importKey = typeof request.body?.importId === "string" ? request.body.importId.trim() : "";
+      if (!/^[a-f0-9-]{36}$/i.test(importKey)) return response.status(400).json({ error: "유효한 업로드 ID가 필요합니다." });
+      const existing = await meetingStore.getByImportKey(request.auth.organization.id, importKey);
+      if (existing) return response.json({ meeting: existing, duplicate: true });
+      if (!process.env.OPENAI_API_KEY) return response.status(503).json({ error: "OPENAI_API_KEY가 설정되지 않았습니다." });
       const transcription = await transcribeAudioFile(request.file, language, request.auth.organization.id);
       if (!transcription.segments?.length) return response.status(422).json({ error: "인식된 대화가 없습니다." });
       const meeting = await meetingStore.createCompleted({
@@ -815,7 +819,8 @@ app.post("/api/meetings/import", requireTrustedOrigin, requireAuth, requireOrgan
         mode: "speaker",
         title: uploadTitle(request.file.originalname),
         segments: transcription.segments,
-        duration: transcription.duration
+        duration: transcription.duration,
+        importKey
       });
       return response.status(201).json({ meeting });
     } catch (error) {

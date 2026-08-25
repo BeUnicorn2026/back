@@ -101,12 +101,19 @@ test("PostgreSQL meeting store creates completed uploads atomically", async () =
       /대화 내용/);
     assert.equal((await store.list("org")).length, 0);
     const meeting = await store.createCompleted({
-      organizationId: "org", createdBy: "user", title: "인터뷰.wav",
+      organizationId: "org", createdBy: "user", title: "인터뷰.wav", importKey: "9aebfbe1-6436-4996-8ee5-46ff80ade67d",
       segments: [{ speaker: "민수", start: 0, end: 5.5, text: "원자적으로 저장합니다." }]
     });
     assert.equal(meeting.status, "completed");
     assert.equal(meeting.duration, 5.5);
     assert.equal(meeting.segmentCount, 1);
+    const duplicate = await store.createCompleted({
+      organizationId: "org", createdBy: "user", importKey: "9aebfbe1-6436-4996-8ee5-46ff80ade67d",
+      segments: [{ text: "중복" }]
+    });
+    assert.equal(duplicate.id, meeting.id);
+    assert.equal((await store.list("org")).length, 1);
+    assert.equal((await store.getByImportKey("org", "9aebfbe1-6436-4996-8ee5-46ff80ade67d")).id, meeting.id);
   });
 });
 
