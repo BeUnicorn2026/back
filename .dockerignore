@@ -1,0 +1,15 @@
+.git
+.gitignore
+.env
+.data
+.cache
+node_modules
+coverage
+output
+test
+._*
+.DS_Store
+.agents
+.codex
+AGENTS.md
+README.md

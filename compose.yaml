@@ -1,13 +1,18 @@
 services:
   voice-partition:
     build: .
+    init: true
     restart: unless-stopped
+    mem_limit: 5g
+    mem_reservation: 1g
+    pids_limit: 512
     ports:
       - "3001:3001"
     env_file:
       - .env
     environment:
       NODE_ENV: production
+      NODE_OPTIONS: --max-old-space-size=4096
       PORT: 3001
       VOICE_PARTITION_DATA_DIR: /app/.data
       SPEAKER_MODEL_CACHE: /app/.cache/speaker-models
@@ -15,6 +20,8 @@ services:
     volumes:
       - voice-partition-data:/app/.data
       - voice-partition-speaker-models:/app/.cache/speaker-models
+    tmpfs:
+      - /tmp:size=256m,mode=1777
     stop_grace_period: 15s
 
 volumes:
