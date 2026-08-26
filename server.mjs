@@ -195,7 +195,9 @@ async function prepareSpeakerModel() {
     const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath, {
       origin: speakerInferenceOrigin,
       token: process.env.SPEAKER_INFERENCE_TOKEN,
-      tokenFile: speakerInferenceTokenFile
+      tokenFile: speakerInferenceTokenFile,
+      dimensions: speakerModelInfo.dimensions,
+      matchThreshold: speakerModelInfo.defaultMatchThreshold
     });
     speakerModelState = "ready";
     speakerModelFailure = null;

@@ -27,9 +27,16 @@ MAX_AUDIO_BYTES = SAMPLE_RATE * 2 * 15
 
 
 class EmbeddingPool:
-    def __init__(self, model_path: str, workers: int, threads_per_worker: int) -> None:
+    def __init__(
+        self,
+        model_path: str,
+        workers: int,
+        threads_per_worker: int,
+        fixed_window_seconds: float,
+    ) -> None:
         self.model_path = model_path
         self.workers = max(1, workers)
+        self.fixed_window_samples = max(0, round(fixed_window_seconds * SAMPLE_RATE))
         self._pool: queue.Queue[sherpa_onnx.SpeakerEmbeddingExtractor] = queue.Queue()
         for _ in range(self.workers):
             config = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
@@ -44,14 +51,32 @@ class EmbeddingPool:
         self.dimensions = extractor.dim
         self._pool.put(extractor)
 
+    def _windows(self, pcm: np.ndarray) -> list[np.ndarray]:
+        if not self.fixed_window_samples:
+            return [pcm]
+        size = self.fixed_window_samples
+        if pcm.size < size:
+            return [np.pad(pcm, (0, size - pcm.size))]
+        starts = list(range(0, pcm.size - size + 1, size))
+        if starts[-1] != pcm.size - size:
+            starts.append(pcm.size - size)
+        return [pcm[start : start + size] for start in starts]
+
     def embed(self, pcm_bytes: bytes) -> list[float]:
         pcm = np.frombuffer(pcm_bytes, dtype="<i2").astype(np.float32) / 32768.0
         extractor = self._pool.get()
         try:
-            stream = extractor.create_stream()
-            stream.accept_waveform(sample_rate=SAMPLE_RATE, waveform=pcm)
-            stream.input_finished()
-            embedding = np.asarray(extractor.compute(stream), dtype=np.float32)
+            embeddings = []
+            for window in self._windows(pcm):
+                stream = extractor.create_stream()
+                stream.accept_waveform(sample_rate=SAMPLE_RATE, waveform=window)
+                stream.input_finished()
+                vector = np.asarray(extractor.compute(stream), dtype=np.float32)
+                vector_norm = float(np.linalg.norm(vector))
+                if not vector.size or not np.isfinite(vector_norm) or vector_norm <= 0:
+                    raise RuntimeError("Speaker model returned an invalid embedding")
+                embeddings.append(vector / vector_norm)
+            embedding = np.mean(embeddings, axis=0)
         finally:
             self._pool.put(extractor)
         norm = float(np.linalg.norm(embedding))
@@ -101,6 +126,7 @@ class Handler(BaseHTTPRequestHandler):
             "sampleRate": SAMPLE_RATE,
             "dimensions": self.server.model.dimensions,
             "workers": self.server.model.workers,
+            "fixedWindowSeconds": self.server.model.fixed_window_samples / SAMPLE_RATE,
             "uptimeSeconds": round(time.time() - self.server.started_at),
         })
 
@@ -158,6 +184,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=int(os.getenv("SPEAKER_WORKERS", "3")))
     parser.add_argument("--threads", type=int, default=int(os.getenv("SPEAKER_THREADS", "2")))
     parser.add_argument("--max-pending", type=int, default=int(os.getenv("SPEAKER_MAX_PENDING", "24")))
+    parser.add_argument(
+        "--fixed-window-seconds",
+        type=float,
+        default=float(os.getenv("SPEAKER_FIXED_WINDOW_SECONDS", "0")),
+    )
     return parser.parse_args()
 
 
@@ -173,7 +204,7 @@ def main() -> None:
             pass
     if len(token) < 32:
         raise RuntimeError("SPEAKER_API_TOKEN or SPEAKER_API_TOKEN_FILE must contain at least 32 characters")
-    model = EmbeddingPool(args.model, args.workers, args.threads)
+    model = EmbeddingPool(args.model, args.workers, args.threads, args.fixed_window_seconds)
     server = SpeakerServer(
         (args.host, args.port),
         Handler,
