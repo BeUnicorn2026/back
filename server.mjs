@@ -224,7 +224,11 @@ function transcriptProfileForCurrentUser(auth) {
 async function roomTranscriptProfile(auth) {
   if (!speakerRecognitionEnabled) return transcriptProfileForCurrentUser(auth);
   const canonical = await resolveCanonicalVoice({ voiceProfileStore, speakerStore, auth });
-  if (canonical.state === "ready") return canonical.profile;
+  if (canonical.state === "ready") {
+    return speakerProfileNeedsMigration(canonical.profile, speakerModelInfo)
+      ? migrateOwnedSpeakerProfile(canonical.profile, auth)
+      : canonical.profile;
+  }
   const legacyOwnedProfile = (await loadCurrentSpeakerProfiles(auth.organization.id))
     .find((profile) => profile.createdBy === auth.user.id);
   if (legacyOwnedProfile) {
@@ -692,6 +696,48 @@ async function enrollProfile(pcm) {
 }
 
 const speakerProfileMigrationPromises = new Map();
+
+async function migrateOwnedSpeakerProfile(profile, auth) {
+  let migration = speakerProfileMigrationPromises.get(profile.id);
+  if (!migration) {
+    migration = (async () => {
+      const model = await prepareSpeakerModel();
+      await migrateSpeakerProfiles([profile], {
+        model,
+        modelInfo: speakerModelInfo,
+        decodeReference: async (referenceAudio) => {
+          const decoded = await decodeToPcm(referenceAudio);
+          return new Int16Array(decoded.buffer, decoded.byteOffset, Math.floor(decoded.byteLength / 2));
+        },
+        replace: async (metadata, profileBuffer, referenceAudio) => {
+          const replaced = await speakerStore.replaceOwned(
+            metadata, profileBuffer, referenceAudio, auth.user.id
+          );
+          if (!replaced) throw new Error("소유한 목소리 프로필만 갱신할 수 있습니다.");
+        }
+      });
+      const updated = await speakerStore.loadOwnedProfile(profile.id, auth.user.id);
+      if (speakerProfileNeedsMigration(updated, speakerModelInfo)) {
+        throw new Error("목소리 프로필 모델 갱신을 확인하지 못했습니다.");
+      }
+      console.log(JSON.stringify({
+        level: "info",
+        event: "owned_speaker_profile_migrated",
+        userId: auth.user.id,
+        speakerProfileId: profile.id,
+        model: speakerModelInfo.id
+      }));
+      return {
+        ...updated,
+        userId: auth.user.id,
+        speakerProfileId: updated.id,
+        displayName: auth.user.name
+      };
+    })().finally(() => speakerProfileMigrationPromises.delete(profile.id));
+    speakerProfileMigrationPromises.set(profile.id, migration);
+  }
+  return migration;
+}
 
 async function loadCurrentSpeakerProfiles(organizationId) {
   const speakers = await speakerStore.loadProfiles(organizationId);
