@@ -30,7 +30,7 @@ test("sends raw PCM to an authenticated remote speaker embedding service", async
   assert.equal(request.options.headers.authorization, "Bearer test-token");
   assert.equal(request.options.body.byteLength, pcm.byteLength);
   assert.equal(embedding.length, 512);
-  assert.equal(model.matchThreshold, 0.5);
+  assert.equal(model.matchThreshold, 0.6);
 });
 
 test("runs inference for clean speech below the stricter enrollment volume", async () => {
