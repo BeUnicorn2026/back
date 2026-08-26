@@ -11,7 +11,6 @@ Endpoints:
 - `POST /v1/embeddings` with `Authorization: Bearer ...` and
   `Content-Type: application/octet-stream`
 
-Production uses the multilingual VoxBlink2 SimAM-ResNet100 speaker-verification
-model. Its fixed 2-second ONNX input is handled by splitting longer requests and
-averaging normalized embeddings. The response embedding format is model-specific;
-users need to enroll again after any model or dimension change.
+The response embedding format is model-specific. Existing WeSpeaker profiles must
+not be compared with 3D-Speaker embeddings; users need to enroll again after the
+backend switches models.

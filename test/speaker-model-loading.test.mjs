@@ -33,21 +33,6 @@ test("sends raw PCM to an authenticated remote speaker embedding service", async
   assert.equal(model.matchThreshold, 0.6);
 });
 
-test("accepts the configured dimensions of a remote verification model", async () => {
-  const model = new RemoteSpeakerEmbeddingModel({
-    origin: "http://127.0.0.1:8710",
-    token: "test-token",
-    dimensions: 256,
-    matchThreshold: 0.45,
-    fetchImpl: async () => new Response(JSON.stringify({
-      embedding: [1, ...Array(255).fill(0)]
-    }), { status: 200, headers: { "content-type": "application/json" } })
-  });
-  const embedding = await model.embed(new Int16Array(2 * 16_000).fill(1_000));
-  assert.equal(embedding.length, 256);
-  assert.equal(model.matchThreshold, 0.45);
-});
-
 test("runs inference for clean speech below the stricter enrollment volume", async () => {
   let inferenceCalls = 0;
   const model = new SpeakerEmbeddingModel({
