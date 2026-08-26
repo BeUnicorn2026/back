@@ -31,7 +31,6 @@ import {
   bindRoomMeeting,
   publicRoom,
   publishSelfEnrollment,
-  requireCanonicalVoice,
   requireRoomMember,
   resolveCanonicalVoice,
   roomErrorHttpStatus,
@@ -180,13 +179,12 @@ const tossPayments = new TossPaymentsClient({
 });
 const speakerModelCache = process.env.SPEAKER_MODEL_CACHE || path.join(projectDirectory, ".cache", "speaker-models");
 const speakerModelPath = process.env.SPEAKER_MODEL_PATH || "";
-// 화자 recognition 모델은 판정 품질을 다시 검증할 때까지 비활성화한다.
-// const speakerRecognitionEnabled = process.env.SPEAKER_RECOGNITION_ENABLED !== "false";
-// const shouldPreloadSpeakerModel = process.env.PRELOAD_SPEAKER_MODEL === "true"
-//   || (process.env.NODE_ENV === "production" && process.env.PRELOAD_SPEAKER_MODEL !== "false");
-const speakerRecognitionEnabled = false;
-const shouldPreloadSpeakerModel = false;
-let speakerModelState = "disabled";
+const speakerRecognitionEnabled = process.env.SPEAKER_RECOGNITION_ENABLED === "true";
+const shouldPreloadSpeakerModel = speakerRecognitionEnabled && (
+  process.env.PRELOAD_SPEAKER_MODEL === "true"
+  || (process.env.NODE_ENV === "production" && process.env.PRELOAD_SPEAKER_MODEL !== "false")
+);
+let speakerModelState = speakerRecognitionEnabled ? "idle" : "disabled";
 let speakerModelFailure = null;
 
 async function prepareSpeakerModel() {
@@ -216,12 +214,25 @@ function transcriptProfileForCurrentUser(auth) {
 }
 
 async function roomTranscriptProfile(auth) {
-  // 화자 recognition을 다시 켤 때만 회의 입장 전에 등록 프로필을 요구한다.
-  // return (await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth })).profile;
-  if (speakerRecognitionEnabled) {
-    return (await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth })).profile;
+  if (!speakerRecognitionEnabled) return transcriptProfileForCurrentUser(auth);
+  const canonical = await resolveCanonicalVoice({ voiceProfileStore, speakerStore, auth });
+  if (canonical.state === "ready") return canonical.profile;
+  const legacyOwnedProfile = (await loadCurrentSpeakerProfiles(auth.organization.id))
+    .find((profile) => profile.createdBy === auth.user.id);
+  if (legacyOwnedProfile) {
+    return {
+      ...legacyOwnedProfile,
+      userId: auth.user.id,
+      speakerProfileId: legacyOwnedProfile.id,
+      displayName: auth.user.name
+    };
   }
-  return transcriptProfileForCurrentUser(auth);
+  throw new VoiceProfileError(
+    canonical.state === "invalid" ? "VOICE_PROFILE_INVALID" : "VOICE_PROFILE_MISSING",
+    canonical.state === "invalid"
+      ? "목소리 프로필이 유효하지 않습니다. 설정에서 다시 등록해 주세요."
+      : "내 목소리만 기록하려면 설정에서 먼저 목소리를 등록해 주세요."
+  );
 }
 const maxAudioBytes = 25 * 1024 * 1024;
 const upload = multer({
@@ -1111,7 +1122,7 @@ app.get("/api/speakers", requireAuth, requireOrganization, async (request, respo
 });
 
 app.post("/api/rooms", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
-  // await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
+  await roomTranscriptProfile(request.auth);
   const room = await roomStore.create({
     organizationId: request.auth.organization.id,
     createdBy: request.auth.user.id,
@@ -1122,7 +1133,7 @@ app.post("/api/rooms", requireTrustedOrigin, requireAuth, requireOrganization, r
 });
 
 app.post("/api/rooms/join", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
-  // await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
+  await roomTranscriptProfile(request.auth);
   const room = await roomStore.join({
     organizationId: request.auth.organization.id,
     userId: request.auth.user.id,
@@ -1151,7 +1162,7 @@ app.post("/api/rooms/:id/close", requireTrustedOrigin, requireAuth, requireOrgan
 
 app.post("/api/rooms/:id/meetings", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
   const room = await requireRoomMember({ roomStore, roomId: request.params.id, auth: request.auth });
-  // await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
+  await roomTranscriptProfile(request.auth);
   const meeting = await bindRoomMeeting({
     meetingStore,
     room,
@@ -1717,12 +1728,11 @@ await Promise.all([
 const server = app.listen(port, () => {
   console.log(`ConThink is running at http://localhost:${port}`);
 });
-// 화자 recognition을 다시 켤 때 모델 사전 로드도 함께 복구한다.
-// if (shouldPreloadSpeakerModel) {
-//   prepareSpeakerModel()
-//     .then(() => console.log(JSON.stringify({ level: "info", event: "speaker_model_ready", model: speakerModelInfo.id })))
-//     .catch((error) => console.error(JSON.stringify({ level: "error", event: "speaker_model_failed", message: error.message })));
-// }
+if (shouldPreloadSpeakerModel) {
+  prepareSpeakerModel()
+    .then(() => console.log(JSON.stringify({ level: "info", event: "speaker_model_ready", model: speakerModelInfo.id })))
+    .catch((error) => console.error(JSON.stringify({ level: "error", event: "speaker_model_failed", message: error.message })));
+}
 
 const liveServer = new WebSocketServer({ noServer: true });
 const roomLiveHub = new RoomLiveHub({ termBridgeFactory });
