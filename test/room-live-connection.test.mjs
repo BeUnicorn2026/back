@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import WebSocket from "ws";
-import { handleSelfOnlyRoomLive } from "../lib/room-live-connection.mjs";
+import { alignRoomSegmentsToMeetingTimeline, handleSelfOnlyRoomLive } from "../lib/room-live-connection.mjs";
 
 class FakeSocket extends EventEmitter {
   constructor() {
@@ -34,6 +34,19 @@ function voicedPcm(sampleRate, seconds) {
   }
   return Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength);
 }
+
+test("aligns each participant STT clock to the shared meeting timeline", () => {
+  const meetingStartedAt = "2026-08-25T10:00:00.000Z";
+  const earlySpeaker = alignRoomSegmentsToMeetingTimeline(
+    [{ start: 4, end: 5, text: "먼저 말함" }], meetingStartedAt, Date.parse("2026-08-25T10:00:01.000Z")
+  );
+  const lateConnectedSpeaker = alignRoomSegmentsToMeetingTimeline(
+    [{ start: 1, end: 2, text: "나중에 말함" }], meetingStartedAt, Date.parse("2026-08-25T10:00:10.000Z")
+  );
+
+  assert.deepEqual(earlySpeaker.map(({ start, end }) => [start, end]), [[5, 6]]);
+  assert.deepEqual(lateConnectedSpeaker.map(({ start, end }) => [start, end]), [[11, 12]]);
+});
 
 async function waitForMessage(socket, type) {
   const deadline = Date.now() + 1_000;
