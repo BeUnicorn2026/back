@@ -12,8 +12,10 @@ from pathlib import Path
 UPDATES = {
     "SPEAKER_INFERENCE_ORIGIN": "http://127.0.0.1:8710",
     "SPEAKER_INFERENCE_TOKEN_FILE": "/home/dlwjdgns13579/Unicorn/config/speaker-inference.token",
-    "SPEAKER_MATCH_THRESHOLD": "0.60",
-    "SPEAKER_MATCH_MARGIN": "0.08",
+    "SPEAKER_INFERENCE_MODEL_ID": "wespeaker/voxblink2-simam-resnet100",
+    "SPEAKER_INFERENCE_DIMENSIONS": "256",
+    "SPEAKER_MATCH_THRESHOLD": "0.45",
+    "SPEAKER_MATCH_MARGIN": "0.05",
 }
 
 
