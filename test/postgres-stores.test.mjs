@@ -5,7 +5,6 @@ import { AuthError } from "../lib/auth-store.mjs";
 import { PostgresAuthStore } from "../lib/postgres-auth-store.mjs";
 import { PostgresDatabase } from "../lib/postgres-database.mjs";
 import { PostgresMeetingStore } from "../lib/postgres-meeting-store.mjs";
-import { PostgresKnowledgeStore } from "../lib/postgres-knowledge-store.mjs";
 import { PostgresRequestRateLimiter } from "../lib/postgres-rate-limiter.mjs";
 import { PostgresBillingStore } from "../lib/postgres-billing-store.mjs";
 import { transcriptHash } from "../lib/meeting-intelligence.mjs";
@@ -210,35 +209,5 @@ test("PostgreSQL billing store reserves meeting quota atomically", async () => {
       (error) => error.code === "PLAN_MEETING_LIMIT");
     assert.equal(await store.releaseMeeting({ ...parameters, usageKey: "meeting-b" }), true);
     assert.equal((await store.consumeMeeting({ ...parameters, usageKey: "meeting-c" })).used, 2);
-  });
-});
-
-test("PostgreSQL knowledge store keeps evidence idempotent and user-private", async () => {
-  await withDatabase(async (database) => {
-    const store = new PostgresKnowledgeStore(database);
-    const first = await store.recordEvidence({
-      userId: "user-a", conceptLabel: "임베딩", kind: "request_simpler",
-      eventId: "knowledge-event-1", organizationId: "org-a", meetingId: "meeting-a", segmentIndex: 2
-    });
-    assert.equal(first.duplicate, false);
-    assert.equal(first.state.status, "unknown");
-    const duplicate = await store.recordEvidence({
-      userId: "user-a", conceptLabel: "임베딩", kind: "request_simpler", eventId: "knowledge-event-1"
-    });
-    assert.equal(duplicate.duplicate, true);
-    assert.equal(duplicate.state.evidenceCount, 1);
-    assert.equal((await store.list("user-b")).length, 0);
-    assert.equal((await store.statesForTerms("user-a", ["임베딩"], [])).at(0).source, "evidence");
-    const cacheKey = "b".repeat(64);
-    const saved = await store.saveExplanation({
-      userId: "user-a", cacheKey, conceptLabel: "임베딩", level: "simple",
-      result: { explanation: "개인 설명", correctChoiceIndex: 2 }, source: "local"
-    });
-    assert.equal(saved.result.correctChoiceIndex, 2);
-    assert.equal(await store.getExplanation("user-b", cacheKey), null);
-    assert.equal((await store.getExplanation("user-a", cacheKey)).term, "임베딩");
-    assert.equal(await store.claimExplanationAnswer("user-a", cacheKey, 2), true);
-    assert.equal(await store.claimExplanationAnswer("user-a", cacheKey, 1), false);
-    assert.equal((await store.getExplanation("user-a", cacheKey)).answeredChoiceIndex, 2);
   });
 });

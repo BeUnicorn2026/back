@@ -49,7 +49,6 @@ test("locally rebuilds the sentence by replacing the difficult term, not definin
   assert.notEqual(result.rewrittenContext, result.originalSentence);
   assert.match(result.rewrittenContext, /도입하기로 했다/);
   assert.equal(result.contextRepaired, true);
-  assert.equal(result.choices.length, 3);
 
   const base = { term: "임베딩", definition: "정의", context: "문맥", level: "simple" };
   const left = knowledgeExplanationCacheKey({ ...base, introduction: "기획자입니다" });
@@ -79,9 +78,7 @@ test("sends only the containing sentence and does not store provider responses",
       return new Response(JSON.stringify({
         output: [{ content: [{ type: "output_text", text: JSON.stringify({
           explanation: "쉬운 설명", rewrittenContext: "이번 회의에서 의미를 숫자로 바꾼 값을 도입하기로 했다.",
-          analogy: "지도 좌표와 비슷합니다.",
-          checkQuestion: "임베딩은 무엇인가요?", choices: ["벡터 표현", "일정", "화자명"],
-          correctChoiceIndex: 0, answerRationale: "의미를 벡터로 표현합니다."
+          analogy: "지도 좌표와 비슷합니다."
         }) }] }]
       }), { status: 200, headers: { "Content-Type": "application/json" } });
     }
@@ -109,8 +106,7 @@ test("repairs a model rewrite that leaves the difficult term in place", async ()
     fetch: async () => new Response(JSON.stringify({
       output: [{ content: [{ type: "output_text", text: JSON.stringify({
         explanation: "설명", rewrittenContext: "이번 회의에서 임베딩(어려운 말)을 도입하기로 했다.",
-        analogy: "비유", checkQuestion: "질문", choices: ["하나", "둘", "셋"],
-        correctChoiceIndex: 0, answerRationale: "근거"
+        analogy: "비유"
       }) }] }]
     }), { status: 200, headers: { "Content-Type": "application/json" } })
   });
@@ -123,15 +119,19 @@ test("repairs a model rewrite that leaves the difficult term in place", async ()
   assert.equal(result.contextRepaired, true);
 });
 
-test("rejects malformed quiz output instead of teaching an unverifiable answer", async () => {
+test("ignores legacy quiz fields a model might still emit", async () => {
   const service = new KnowledgeExplanationService({
     apiKey: "test-key",
     fetch: async () => new Response(JSON.stringify({
       output: [{ content: [{ type: "output_text", text: JSON.stringify({
-        explanation: "설명", analogy: "비유", checkQuestion: "질문", choices: ["하나"],
-        correctChoiceIndex: 9, answerRationale: "근거"
+        explanation: "설명", rewrittenContext: "", analogy: "비유",
+        checkQuestion: "질문", choices: ["하나", "둘", "셋"], correctChoiceIndex: 0, answerRationale: "근거"
       }) }] }]
     }), { status: 200, headers: { "Content-Type": "application/json" } })
   });
-  await assert.rejects(service.generate({ userId: "u", term: "VAD", definition: "음성 구간 감지" }), /형식/);
+  const result = await service.generate({ userId: "u", term: "VAD", definition: "음성 구간 감지" });
+  assert.equal("checkQuestion" in result, false);
+  assert.equal("choices" in result, false);
+  assert.equal("correctChoiceIndex" in result, false);
+  assert.equal("answerRationale" in result, false);
 });

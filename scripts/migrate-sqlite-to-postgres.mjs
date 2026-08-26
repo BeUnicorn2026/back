@@ -8,8 +8,6 @@ import { closePostgresDatabases, PostgresDatabase } from "../lib/postgres-databa
 import { PostgresMeetingStore } from "../lib/postgres-meeting-store.mjs";
 import { PostgresRoomStore } from "../lib/postgres-room-store.mjs";
 import { PostgresRequestRateLimiter } from "../lib/postgres-rate-limiter.mjs";
-import { PostgresKnowledgeStore } from "../lib/postgres-knowledge-store.mjs";
-import { insertKnowledgeRows, KNOWLEDGE_TABLES } from "../lib/knowledge-migration.mjs";
 
 const args = process.argv.slice(2);
 const commit = args.includes("--commit");
@@ -43,8 +41,7 @@ await stat(sourcePath).catch(() => {
 const source = new DatabaseSync(sourcePath, { readOnly: true });
 const tableNames = [
   "users", "organizations", "memberships", "sessions", "email_verifications",
-  "rooms", "room_memberships", "meetings", "meeting_segments", "meeting_intelligence", "request_rate_limits",
-  ...KNOWLEDGE_TABLES
+  "rooms", "room_memberships", "meetings", "meeting_segments", "meeting_intelligence", "request_rate_limits"
 ];
 
 function sourceRows(table) {
@@ -75,7 +72,6 @@ try {
   await new PostgresRoomStore(target).initialize();
   await new PostgresMeetingStore(target).initialize();
   await new PostgresRequestRateLimiter(target).initialize();
-  await new PostgresKnowledgeStore(target).initialize();
 
   const targetCounts = {};
   for (const table of tableNames) {
@@ -158,7 +154,6 @@ try {
       await client.query("INSERT INTO request_rate_limits(key_hash, window_started_at, request_count) VALUES ($1, $2, $3)",
         [row.key_hash, row.window_started_at, row.request_count]);
     }
-    await insertKnowledgeRows(client, snapshot);
   });
 
   const verifiedCounts = {};
