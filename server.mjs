@@ -811,7 +811,7 @@ app.post("/api/billing/orders", requireTrustedOrigin, requireAuth, requireOrgani
       orderId: order.orderId,
       planId: order.planId,
       amount: order.amount,
-      orderName: `SSU-ON ${order.planId} 30일 이용권`,
+      orderName: `ConThink ${order.planId} 30일 이용권`,
       expiresAt: order.expiresAt
     });
   });
@@ -1715,7 +1715,7 @@ await Promise.all([
   voiceProfileStore.initialize(), billingStore.initialize(), requestRateLimiter.initialize()
 ]);
 const server = app.listen(port, () => {
-  console.log(`Voice Partition is running at http://localhost:${port}`);
+  console.log(`ConThink is running at http://localhost:${port}`);
 });
 // 화자 recognition을 다시 켤 때 모델 사전 로드도 함께 복구한다.
 // if (shouldPreloadSpeakerModel) {

@@ -1,4 +1,4 @@
-# Voice Partition Backend
+# ConThink Backend
 
 ## Go migration server
 
