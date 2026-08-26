@@ -179,6 +179,8 @@ const tossPayments = new TossPaymentsClient({
 });
 const speakerModelCache = process.env.SPEAKER_MODEL_CACHE || path.join(projectDirectory, ".cache", "speaker-models");
 const speakerModelPath = process.env.SPEAKER_MODEL_PATH || "";
+const speakerInferenceOrigin = process.env.SPEAKER_INFERENCE_ORIGIN || "";
+const speakerInferenceTokenFile = process.env.SPEAKER_INFERENCE_TOKEN_FILE || "";
 const speakerRecognitionEnabled = process.env.SPEAKER_RECOGNITION_ENABLED === "true";
 const shouldPreloadSpeakerModel = speakerRecognitionEnabled && (
   process.env.PRELOAD_SPEAKER_MODEL === "true"
@@ -190,7 +192,11 @@ let speakerModelFailure = null;
 async function prepareSpeakerModel() {
   if (speakerModelState !== "ready") speakerModelState = "loading";
   try {
-    const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath);
+    const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath, {
+      origin: speakerInferenceOrigin,
+      token: process.env.SPEAKER_INFERENCE_TOKEN,
+      tokenFile: speakerInferenceTokenFile
+    });
     speakerModelState = "ready";
     speakerModelFailure = null;
     return model;
@@ -1630,7 +1636,10 @@ app.post("/api/speakers/:id/samples", requireTrustedOrigin, requireAuth, require
       registeredSpeakers.filter(({ id }) => id !== existing.id)
     );
     if (!extension.accepted) return response.status(422).json({ error: extension.reason, comparison: extension });
-    const merged = mergeSpeakerProfileVectors([existing.profiles, additional.vectors], { maximumProfiles: 32 });
+    const merged = mergeSpeakerProfileVectors([existing.profiles, additional.vectors], {
+      maximumProfiles: 32,
+      matchThreshold: speakerModelInfo.defaultMatchThreshold
+    });
     if (merged.consistency < 0.58) return response.status(422).json({ error: "추가 후 목소리 특성의 일관성이 너무 낮아 저장하지 않았습니다." });
     const profileBuffer = Buffer.concat(merged.vectors.map((vector) => Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength)));
     const now = new Date().toISOString();
