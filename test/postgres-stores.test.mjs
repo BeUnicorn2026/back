@@ -61,7 +61,8 @@ test("PostgreSQL auth store supports the complete organization onboarding flow",
     assert.ok(members.every((listed) => !("introduction" in listed)));
     assert.equal("passwordHash" in joined.user, false);
 
-    const updated = await store.updateProfile(owner.id, { introduction: "  백엔드 프로필  " });
+    const updated = await store.updateProfile(owner.id, { name: "  새 오너  ", introduction: "  백엔드 프로필  " });
+    assert.equal(updated.user.name, "새 오너");
     assert.equal(updated.user.introduction, "백엔드 프로필");
     await assert.rejects(store.updateProfile(owner.id, { introduction: "가".repeat(501) }),
       (error) => error instanceof AuthError && error.code === "INTRODUCTION_INVALID");

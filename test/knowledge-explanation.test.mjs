@@ -94,8 +94,9 @@ test("sends only the containing sentence and does not store provider responses",
   assert.equal(JSON.parse(request.input).context, "이번 회의에서 임베딩을 도입하기로 했다.");
   assert.equal(request.store, false);
   assert.equal(request.text.format.type, "json_schema");
-  assert.deepEqual(Object.keys(JSON.parse(request.input)), ["term", "definition", "context", "introduction", "level"]);
-  assert.equal(JSON.parse(request.input).introduction, "디자인 팀 신입입니다");
+  assert.deepEqual(Object.keys(JSON.parse(request.input)), ["term", "definition", "context", "level"]);
+  assert.equal(JSON.parse(request.input).introduction, undefined);
+  assert.equal(request.instructions.includes("디자인 팀 신입입니다"), true);
   assert.notEqual(request.safety_identifier, "private-user");
   assert.equal(JSON.stringify(request).includes("pKnown"), false);
 });

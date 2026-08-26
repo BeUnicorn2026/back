@@ -115,12 +115,13 @@ test("room close durably completes its active meeting and binding cannot race af
   const roomStore = new RoomStore(root, {
     databasePath,
     uuidFactory: () => "00000000-0000-4000-8000-000000000001",
+    roomFactory: () => "1234",
     accessCodeFactory: () => "VP-0123456789AB"
   });
   const meetingStore = new MeetingStore(root, { databasePath });
   await Promise.all([roomStore.initialize(), meetingStore.initialize()]);
   const room = await roomStore.create({
-    organizationId: organization.id, createdBy: user.id, room: "AB12", idempotencyKey: "close-test"
+    organizationId: organization.id, createdBy: user.id, command: "ROOM", idempotencyKey: "close-test"
   });
   const meeting = await meetingStore.bindRoomMeeting({
     organizationId: organization.id, createdBy: user.id, roomId: room.id, title: room.room

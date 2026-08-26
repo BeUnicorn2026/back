@@ -49,6 +49,7 @@ import { KnowledgeFilterService, personalizeKnowledgeTerms } from "./lib/knowled
 import { TermExtractionService } from "./lib/term-extraction.mjs";
 import { createNoopTermLiveBridge, createTermLiveBridge } from "./lib/term-live-bridge.mjs";
 import { KnowledgeExplanationService, knowledgeExplanationCacheKey } from "./lib/knowledge-explanation.mjs";
+import { PersonalizedTranscriptService } from "./lib/personalized-transcript.mjs";
 import { normalizeUploadFilename, uploadTitle } from "./lib/upload-filename.mjs";
 import { productionEnvironmentIssues, serviceReadiness } from "./lib/service-readiness.mjs";
 import { createConcurrencyLimit } from "./lib/concurrency-limit.mjs";
@@ -169,6 +170,10 @@ const termBridgeFactory = termExtractionService.mode === "openai"
     log
   })
   : null;
+const personalizedTranscriptService = new PersonalizedTranscriptService({
+  apiKey: process.env.OPENAI_API_KEY,
+  model: process.env.OPENAI_EXPLANATION_MODEL || process.env.OPENAI_ANALYSIS_MODEL
+});
 const tossPayments = new TossPaymentsClient({
   clientKey: process.env.TOSS_CLIENT_KEY,
   secretKey: process.env.TOSS_SECRET_KEY
@@ -307,6 +312,8 @@ const speakerIdentificationRateLimit = rateLimit("speaker-identification", { lim
   `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
 const knowledgeExplanationRateLimit = rateLimit("knowledge-explanation", { limit: 30, windowMs: 60 * 60_000 }, (request) =>
   request.auth?.user?.id || request.ip);
+const personalizedTranscriptRateLimit = rateLimit("personalized-transcript", { limit: 600, windowMs: 60 * 60_000 }, (request) =>
+  request.auth?.user?.id || request.ip);
 const transcriptionRateLimit = rateLimit("transcription", { limit: 12, windowMs: 60 * 60_000 }, (request) =>
   `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
 const billingOrderRateLimit = rateLimit("billing-order", { limit: 10, windowMs: 60 * 60_000 }, (request) =>
@@ -408,6 +415,7 @@ function configuredServices() {
     knowledgeFilter: knowledgeFilterService.mode,
     termExtraction: termExtractionService.mode,
     knowledgePersistence: "memory-only",
+    personalizedTranscript: personalizedTranscriptService.mode,
     database: databaseMode,
     speakerStorage: speakerStorageMode,
     speakerModel: speakerModelInfo.id,
@@ -837,23 +845,6 @@ app.post("/api/billing/confirm", requireTrustedOrigin, requireAuth, requireOrgan
     }
   });
 
-app.get("/api/organizations/suggestion", requireAuth, async (request, response) => {
-  response.json({ suggestion: await authStore.organizationSuggestion(request.auth.user.id) });
-});
-
-app.post("/api/organizations", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
-  response.status(201).json(await authStore.createOrganization(request.auth.user.id, request.body || {}));
-});
-
-app.post("/api/organizations/join", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
-  response.json(await authStore.joinOrganization(request.auth.user.id, request.body?.inviteCode));
-});
-
-app.get("/api/organizations/current/members", requireAuth, requireOrganization, async (request, response) => {
-  const members = await authStore.listMembers(request.auth.user.id, request.auth.organization.id);
-  response.json({ organization: request.auth.organization, members });
-});
-
 app.put("/api/profile", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
   response.json({ authenticated: true, ...await authStore.updateProfile(request.auth.user.id, request.body || {}) });
 });
@@ -944,6 +935,62 @@ app.get("/api/vocabulary/terms", requireAuth, requireOrganization, async (reques
   response.json({ terms: await personalizedTermsFor(request.auth.user, terms) });
 });
 
+app.post("/api/transcript/translations", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
+  personalizedTranscriptRateLimit, async (request, response) => {
+    const meetingId = String(request.body?.meetingId || "").trim();
+    const requestedSequences = Array.isArray(request.body?.segmentSequences)
+      ? request.body.segmentSequences : [];
+    if (!meetingId || !requestedSequences.length || requestedSequences.length > 12) {
+      return response.status(400).json({ error: "회의와 1~12개의 발화 순서가 필요합니다." });
+    }
+    const segmentSequences = [...new Set(requestedSequences.map(Number))];
+    if (segmentSequences.some((sequence) => !Number.isSafeInteger(sequence) || sequence < 0)) {
+      return response.status(400).json({ error: "발화 순서가 올바르지 않습니다." });
+    }
+    const meeting = await requireMeetingAccess({
+      meetingStore,
+      roomStore,
+      meetingId,
+      auth: request.auth
+    });
+    const positions = new Map(meeting.segments.map((segment, index) => [Number(segment.sequence), { segment, index }]));
+    const selected = segmentSequences.map((sequence) => ({ sequence, ...positions.get(sequence) }))
+      .filter(({ segment }) => segment?.text);
+    const missingSequences = segmentSequences.filter((sequence) => !positions.has(sequence));
+    const introduction = request.auth.user.introduction || "";
+    try {
+      const generated = await personalizedTranscriptService.translate({
+        userId: request.auth.user.id,
+        introduction,
+        items: selected.map(({ sequence, segment }) => ({ id: String(sequence), text: segment.text }))
+      });
+      const generatedBySequence = new Map(generated.translations.map((item) => [Number(item.id), item]));
+      const translations = selected.map((item) => {
+        const personalized = generatedBySequence.get(item.sequence) || {
+          originalText: item.segment.text,
+          personalizedText: item.segment.text,
+          changed: false
+        };
+        return {
+          segmentSequence: item.sequence,
+          originalText: personalized.originalText,
+          personalizedText: personalized.personalizedText,
+          changed: personalized.changed,
+          introductionApplied: Boolean(introduction),
+          source: generated.source,
+          model: generated.model
+        };
+      });
+      return response.status(201).json({ translations, missingSequences });
+    } catch (error) {
+      console.error("Personalized transcript translation failed:", error);
+      return response.status(error?.name === "AbortError" ? 504 : 502).json({
+        error: error?.name === "AbortError"
+          ? "발화 맞춤 번역 시간이 초과되었습니다."
+          : "발화를 내 자기소개에 맞게 번역하지 못했습니다. 잠시 후 다시 시도해 주세요."
+      });
+    }
+  });
 app.post("/api/knowledge/explanations", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
   knowledgeExplanationRateLimit, async (request, response) => {
     const meetingId = String(request.body?.meetingId || "").trim();
@@ -1068,7 +1115,7 @@ app.post("/api/rooms", requireTrustedOrigin, requireAuth, requireOrganization, r
   const room = await roomStore.create({
     organizationId: request.auth.organization.id,
     createdBy: request.auth.user.id,
-    room: request.body?.room,
+    command: request.body?.command,
     idempotencyKey: request.headers["idempotency-key"] || request.body?.idempotencyKey
   });
   response.status(201).json({ room: publicRoom(room, { includeAccessCode: true }) });
@@ -1079,7 +1126,8 @@ app.post("/api/rooms/join", requireTrustedOrigin, requireAuth, requireOrganizati
   const room = await roomStore.join({
     organizationId: request.auth.organization.id,
     userId: request.auth.user.id,
-    accessCode: request.body?.accessCode
+    accessCode: request.body?.accessCode,
+    room: request.body?.room
   });
   response.json({ room: publicRoom(room) });
 });
