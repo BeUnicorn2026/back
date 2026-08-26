@@ -52,7 +52,6 @@ test("two segments form one chunk, and new terms are pushed as term_batch", asyn
   await bridge.finalize();
   assert.equal(extraction.calls.length, 1);
   assert.equal(extraction.calls[0].chunk, "기존 파이프라인이 있습니다 파인튜닝으로 바꾸죠");
-  assert.equal(extraction.calls[0].meetingTopic, "기획 회의");
   assert.equal(member.messages.length, 1);
   assert.equal(member.messages[0].type, "term_batch");
   const pushed = member.messages[0].payload.terms;
@@ -155,12 +154,62 @@ test("finalize flushes a pending single-sentence chunk; replay and dispose are i
   assert.equal(extraction.calls.length, 1);
 });
 
-test("participant snapshot failures never break chunk processing", async () => {
+test("speakers never receive term cards for their own speech", async () => {
+  const extraction = fakeExtraction([[TERM_A]]);
+  const filterCalls = [];
+  const filter = {
+    async familiarTerms(input) {
+      filterCalls.push(input.userId);
+      return { familiarKeys: new Set() };
+    }
+  };
+  const ceo = participant("user-ceo");
+  const dev = participant("user-dev");
+  const bridge = createTermLiveBridge({ extraction, filter, participants: () => [ceo, dev] });
+  // CEO가 말한 청크: CEO 세그먼트에는 본인의 userId가 실려 온다.
+  bridge.handleFinalSegment({ text: "SLA 얘기입니다. ARR도요.", userId: "user-ceo", speaker: "CEO" });
+  await bridge.finalize();
+  assert.equal(extraction.calls.length, 1);
+  // CEO에게는 Stage 2 호출도, 푸시도 가지 않는다.
+  assert.deepEqual(filterCalls, ["user-dev"]);
+  assert.equal(ceo.messages.length, 0);
+  assert.equal(dev.messages.length, 1);
+});
+
+test("a chunk whose only audience is its own speaker skips the API entirely", async () => {
+  const extraction = fakeExtraction([[TERM_A]]);
+  const solo = participant("user-ceo");
+  const bridge = createTermLiveBridge({ extraction, filter: openFilter(), participants: () => [solo] });
+  bridge.handleFinalSegment({ text: "SLA 얘기입니다. ARR도요.", userId: "user-ceo", speaker: "CEO" });
+  await bridge.finalize();
+  assert.equal(extraction.calls.length, 0);
+  assert.equal(solo.messages.length, 0);
+});
+
+test("filter receives definitions and the participant's known terms", async () => {
+  const extraction = fakeExtraction([[TERM_A]]);
+  let received;
+  const filter = {
+    async familiarTerms(input) {
+      received = input;
+      return { familiarKeys: new Set() };
+    }
+  };
+  const member = participant("user-a", { knownTerms: ["ARR"] });
+  const bridge = createTermLiveBridge({ extraction, filter, participants: () => [member] });
+  bridge.handleFinalSegment({ text: "파인튜닝. 임베딩." });
+  await bridge.finalize();
+  assert.deepEqual(received.candidateTerms, [{ term: "파인튜닝", definition: "추가 학습 작업입니다." }]);
+  assert.deepEqual(received.knownTerms, ["ARR"]);
+});
+
+test("participant snapshot failures never break the stream (chunk is skipped)", async () => {
   const extraction = fakeExtraction([[TERM_A]]);
   const bridge = createTermLiveBridge({
     extraction, filter: openFilter(), participants: () => { throw new Error("no session"); }
   });
   bridge.handleFinalSegment({ text: "파인튜닝. 임베딩." });
   await bridge.finalize();
-  assert.equal(extraction.calls.length, 1);
+  // 받을 사람을 알 수 없으면 추출 API도 호출하지 않고 조용히 넘어간다.
+  assert.equal(extraction.calls.length, 0);
 });

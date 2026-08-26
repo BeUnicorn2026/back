@@ -73,35 +73,55 @@ test("empty introduction skips the LLM entirely and exposes everything", async (
   assert.equal(result.source, "no_introduction");
 });
 
-function openaiResponse(familiarTerms) {
+function openaiResponse(understoodTerms) {
   return new Response(JSON.stringify({
-    output: [{ content: [{ type: "output_text", text: JSON.stringify({ familiar_terms: familiarTerms }) }] }]
+    output: [{ content: [{ type: "output_text", text: JSON.stringify({ understood_terms: understoodTerms, refined_glossary: [] }) }] }]
   }), { status: 200, headers: { "Content-Type": "application/json" } });
 }
 
-test("sends only introduction and candidate terms, never definitions", async () => {
+test("uses the paper's A.2 prompt with glossary, profile, and preference list", async () => {
   let request;
   const service = new KnowledgeFilterService({
     apiKey: "test-key",
     model: "test-model",
     fetch: async (_url, options) => {
       request = JSON.parse(options.body);
-      return openaiResponse(["임베딩"]);
+      return openaiResponse(["SLA"]);
     }
   });
   const result = await service.familiarTerms({
     userId: "private-user",
-    introduction: "저는 데이터 연구자입니다.",
-    candidateTerms: ["임베딩", "그로스 해킹"]
+    introduction: "저는 스타트업 CEO입니다.",
+    candidateTerms: [
+      { term: "SLA", definition: "서비스 수준 계약입니다." },
+      { term: "온프레미스", definition: "자체 서버 운영 방식입니다." }
+    ],
+    knownTerms: ["ARR"]
   });
-  assert.deepEqual(Object.keys(JSON.parse(request.input)), ["introduction", "candidate_terms"]);
-  assert.deepEqual(JSON.parse(request.input).candidate_terms.sort(), ["그로스 해킹", "임베딩"]);
+  assert.match(request.instructions, /^You are given a glossary, a user profile, and a user preference list\./);
+  assert.match(request.instructions, /understood_terms/);
+  assert.match(request.input, /^Glossary: \[/);
+  assert.ok(request.input.includes('{"SLA":"서비스 수준 계약입니다."}'));
+  assert.ok(request.input.includes("User Profile: 저는 스타트업 CEO입니다."));
+  assert.ok(request.input.includes('User preference: ["ARR"]'));
   assert.equal(request.store, false);
-  assert.equal(request.text.format.strict, true);
+  assert.equal(request.max_output_tokens, 1000);
+  assert.equal("text" in request, false);
   assert.notEqual(request.safety_identifier, "private-user");
-  assert.equal(JSON.stringify(request).includes("definition"), false);
-  assert.ok(result.familiarKeys.has(normalizeTermKey("임베딩")));
+  assert.ok(result.familiarKeys.has(normalizeTermKey("SLA")));
+  assert.equal(result.familiarKeys.has(normalizeTermKey("온프레미스")), false);
   assert.equal(result.source, "openai");
+});
+
+test("plain string candidates are still accepted", async () => {
+  const service = new KnowledgeFilterService({
+    apiKey: "test-key",
+    fetch: async () => openaiResponse(["임베딩"])
+  });
+  const result = await service.familiarTerms({
+    userId: "u", introduction: "데이터 연구자입니다", candidateTerms: ["임베딩", "VAD"]
+  });
+  assert.ok(result.familiarKeys.has(normalizeTermKey("임베딩")));
 });
 
 test("hallucinated terms outside the candidate list are silently dropped", async () => {
@@ -158,6 +178,11 @@ test("caches by introduction and candidate set so repeat views skip the LLM", as
   const other = await service.familiarTerms({ ...input, introduction: "재무 담당입니다" });
   assert.equal(calls, 2);
   assert.equal(other.source, "openai");
+
+  // 아는 용어 목록(User preference)이 달라져도 캐시를 공유하지 않는다.
+  const withPreference = await service.familiarTerms({ ...input, knownTerms: ["VAD"] });
+  assert.equal(calls, 3);
+  assert.equal(withPreference.source, "openai");
 });
 
 test("failed calls are not cached, so the next request retries", async () => {

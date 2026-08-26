@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { TermExtractionService } from "../lib/term-extraction.mjs";
 
-function openaiResponse(terms) {
+function openaiText(text) {
   return new Response(JSON.stringify({
-    output: [{ content: [{ type: "output_text", text: JSON.stringify({ terms }) }] }]
+    output: [{ content: [{ type: "output_text", text }] }]
   }), { status: 200, headers: { "Content-Type": "application/json" } });
 }
 
@@ -25,64 +25,71 @@ test("empty chunks are a normal empty result even with a key", async () => {
   assert.equal(called, false);
 });
 
-test("sends topic, defined terms, and the chunk with a strict schema", async () => {
+test("uses the paper's A.1 prompt and user-message format without a schema", async () => {
   let request;
   const service = new TermExtractionService({
     apiKey: "test-key",
     model: "test-model",
     fetch: async (_url, options) => {
       request = JSON.parse(options.body);
-      return openaiResponse([{
-        term: "파인튜닝", surface: "파인튜닝으로", aliases: ["fine-tuning", "FT"],
-        definition: "이미 학습된 모델에 데이터를 추가로 학습시키는 작업입니다."
-      }]);
+      return openaiText('[{"SLA": "서비스 제공 수준을 계약으로 보장하는 약속입니다."}]');
     }
   });
   const result = await service.extract({
-    meetingTopic: "AI 프로덕트 기획 회의",
     definedTerms: ["임베딩"],
-    chunk: "기존 파이프라인을 파인튜닝으로 바꾸려고 합니다."
+    chunk: "SLA 위반이 계속되면 ARR에도 영향이 갑니다."
   });
-  const input = JSON.parse(request.input);
-  assert.deepEqual(Object.keys(input), ["meeting_topic", "defined_terms", "transcript_chunk"]);
-  assert.deepEqual(input.defined_terms, ["임베딩"]);
+  assert.match(request.instructions, /^Your job is to help a listener understand speeches/);
+  assert.match(request.instructions, /previously defined term list\.$/);
+  assert.equal(request.input, 'Transcript: SLA 위반이 계속되면 ARR에도 영향이 갑니다., Previously defined terms: ["임베딩"]');
   assert.equal(request.store, false);
-  assert.equal(request.text.format.strict, true);
+  assert.equal(request.max_output_tokens, 1000);
+  assert.equal("text" in request, false);
   assert.equal(result.terms.length, 1);
-  assert.equal(result.terms[0].surface, "파인튜닝으로");
-  assert.deepEqual(result.terms[0].aliases, ["fine-tuning", "FT"]);
+  assert.equal(result.terms[0].term, "SLA");
+  assert.equal(result.terms[0].surface, "SLA");
+  assert.deepEqual(result.terms[0].aliases, []);
 });
 
-test("repairs a surface that is not actually in the chunk", async () => {
+test("accepts both paper-style pairs and term/definition objects, with fences", async () => {
   const service = new TermExtractionService({
     apiKey: "test-key",
-    fetch: async () => openaiResponse([{
-      term: "임베딩", surface: "엠베딩을", aliases: [],
-      definition: "의미를 숫자 벡터로 표현한 값입니다."
-    }])
+    fetch: async () => openaiText('```json\n[{"파인튜닝": "추가 학습 작업입니다."}, {"term": "임베딩", "definition": "의미 벡터입니다."}]\n```')
   });
-  const result = await service.extract({ chunk: "이번에 임베딩을 도입합니다." });
-  assert.equal(result.terms[0].surface, "임베딩");
+  const result = await service.extract({ chunk: "파인튜닝으로 임베딩을 만들죠." });
+  assert.deepEqual(result.terms.map(({ term }) => term), ["파인튜닝", "임베딩"]);
+  assert.deepEqual(result.terms.map(({ definition }) => definition), ["추가 학습 작업입니다.", "의미 벡터입니다."]);
 });
 
-test("drops entries missing a term or definition", async () => {
+test("surface uses the chunk's actual spelling, falling back to the term", async () => {
   const service = new TermExtractionService({
     apiKey: "test-key",
-    fetch: async () => openaiResponse([
-      { term: "", surface: "", aliases: [], definition: "정의" },
-      { term: "VAD", surface: "VAD", aliases: [], definition: "" },
-      { term: "임베딩", surface: "임베딩", aliases: [], definition: "의미 벡터입니다." }
-    ])
+    fetch: async () => openaiText('[{"sla": "서비스 수준 계약입니다."}, {"온프레미스": "자체 서버 운영 방식입니다."}]')
+  });
+  const result = await service.extract({ chunk: "SLA 조건을 다시 봅시다." });
+  assert.equal(result.terms[0].surface, "SLA");
+  assert.equal(result.terms[1].surface, "온프레미스");
+});
+
+test("drops pairs missing a term or definition", async () => {
+  const service = new TermExtractionService({
+    apiKey: "test-key",
+    fetch: async () => openaiText('[{"": "정의"}, {"VAD": ""}, {"임베딩": "의미 벡터입니다."}]')
   });
   const result = await service.extract({ chunk: "임베딩 VAD 이야기" });
   assert.equal(result.terms.length, 1);
   assert.equal(result.terms[0].term, "임베딩");
 });
 
-test("throws on provider errors so the caller can discard the chunk", async () => {
-  const service = new TermExtractionService({
+test("throws on provider errors and non-JSON output so the chunk is discarded", async () => {
+  const failing = new TermExtractionService({
     apiKey: "test-key",
     fetch: async () => new Response("{}", { status: 500 })
   });
-  await assert.rejects(service.extract({ chunk: "임베딩을 도입합니다." }), /HTTP 500/);
+  await assert.rejects(failing.extract({ chunk: "임베딩을 도입합니다." }), /HTTP 500/);
+  const chatty = new TermExtractionService({
+    apiKey: "test-key",
+    fetch: async () => openaiText("죄송하지만 용어를 찾지 못했습니다.")
+  });
+  await assert.rejects(chatty.extract({ chunk: "임베딩을 도입합니다." }), /JSON/);
 });

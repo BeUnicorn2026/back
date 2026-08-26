@@ -497,7 +497,8 @@ async function personalizedTermsFor(user, terms) {
   const { familiarKeys, source } = await knowledgeFilterService.familiarTerms({
     userId: user.id,
     introduction: user.introduction || "",
-    candidateTerms: terms.map(({ term }) => term)
+    candidateTerms: terms.map(({ term, definition }) => ({ term, definition })),
+    knownTerms
   });
   return personalizeKnowledgeTerms(terms, { familiarKeys, knownTerms, source });
 }
