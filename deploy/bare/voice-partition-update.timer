@@ -1,5 +1,5 @@
 [Unit]
-Description=Check Voice Partition backend updates every minute
+Description=Check ConThink backend updates every minute
 
 [Timer]
 OnBootSec=45s

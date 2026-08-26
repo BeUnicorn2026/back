@@ -31,7 +31,6 @@ import {
   bindRoomMeeting,
   publicRoom,
   publishSelfEnrollment,
-  requireCanonicalVoice,
   requireRoomMember,
   resolveCanonicalVoice,
   roomErrorHttpStatus,
@@ -49,6 +48,7 @@ import { KnowledgeFilterService, personalizeKnowledgeTerms } from "./lib/knowled
 import { TermExtractionService } from "./lib/term-extraction.mjs";
 import { createNoopTermLiveBridge, createTermLiveBridge } from "./lib/term-live-bridge.mjs";
 import { KnowledgeExplanationService, knowledgeExplanationCacheKey } from "./lib/knowledge-explanation.mjs";
+import { PersonalizedTranscriptService } from "./lib/personalized-transcript.mjs";
 import { normalizeUploadFilename, uploadTitle } from "./lib/upload-filename.mjs";
 import { productionEnvironmentIssues, serviceReadiness } from "./lib/service-readiness.mjs";
 import { createConcurrencyLimit } from "./lib/concurrency-limit.mjs";
@@ -169,25 +169,34 @@ const termBridgeFactory = termExtractionService.mode === "openai"
     log
   })
   : null;
+const personalizedTranscriptService = new PersonalizedTranscriptService({
+  apiKey: process.env.OPENAI_API_KEY,
+  model: process.env.OPENAI_EXPLANATION_MODEL || process.env.OPENAI_ANALYSIS_MODEL
+});
 const tossPayments = new TossPaymentsClient({
   clientKey: process.env.TOSS_CLIENT_KEY,
   secretKey: process.env.TOSS_SECRET_KEY
 });
 const speakerModelCache = process.env.SPEAKER_MODEL_CACHE || path.join(projectDirectory, ".cache", "speaker-models");
 const speakerModelPath = process.env.SPEAKER_MODEL_PATH || "";
-// 화자 recognition 모델은 판정 품질을 다시 검증할 때까지 비활성화한다.
-// const speakerRecognitionEnabled = process.env.SPEAKER_RECOGNITION_ENABLED !== "false";
-// const shouldPreloadSpeakerModel = process.env.PRELOAD_SPEAKER_MODEL === "true"
-//   || (process.env.NODE_ENV === "production" && process.env.PRELOAD_SPEAKER_MODEL !== "false");
-const speakerRecognitionEnabled = false;
-const shouldPreloadSpeakerModel = false;
-let speakerModelState = "disabled";
+const speakerInferenceOrigin = process.env.SPEAKER_INFERENCE_ORIGIN || "";
+const speakerInferenceTokenFile = process.env.SPEAKER_INFERENCE_TOKEN_FILE || "";
+const speakerRecognitionEnabled = process.env.SPEAKER_RECOGNITION_ENABLED === "true";
+const shouldPreloadSpeakerModel = speakerRecognitionEnabled && (
+  process.env.PRELOAD_SPEAKER_MODEL === "true"
+  || (process.env.NODE_ENV === "production" && process.env.PRELOAD_SPEAKER_MODEL !== "false")
+);
+let speakerModelState = speakerRecognitionEnabled ? "idle" : "disabled";
 let speakerModelFailure = null;
 
 async function prepareSpeakerModel() {
   if (speakerModelState !== "ready") speakerModelState = "loading";
   try {
-    const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath);
+    const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath, {
+      origin: speakerInferenceOrigin,
+      token: process.env.SPEAKER_INFERENCE_TOKEN,
+      tokenFile: speakerInferenceTokenFile
+    });
     speakerModelState = "ready";
     speakerModelFailure = null;
     return model;
@@ -211,12 +220,25 @@ function transcriptProfileForCurrentUser(auth) {
 }
 
 async function roomTranscriptProfile(auth) {
-  // 화자 recognition을 다시 켤 때만 회의 입장 전에 등록 프로필을 요구한다.
-  // return (await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth })).profile;
-  if (speakerRecognitionEnabled) {
-    return (await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth })).profile;
+  if (!speakerRecognitionEnabled) return transcriptProfileForCurrentUser(auth);
+  const canonical = await resolveCanonicalVoice({ voiceProfileStore, speakerStore, auth });
+  if (canonical.state === "ready") return canonical.profile;
+  const legacyOwnedProfile = (await loadCurrentSpeakerProfiles(auth.organization.id))
+    .find((profile) => profile.createdBy === auth.user.id);
+  if (legacyOwnedProfile) {
+    return {
+      ...legacyOwnedProfile,
+      userId: auth.user.id,
+      speakerProfileId: legacyOwnedProfile.id,
+      displayName: auth.user.name
+    };
   }
-  return transcriptProfileForCurrentUser(auth);
+  throw new VoiceProfileError(
+    canonical.state === "invalid" ? "VOICE_PROFILE_INVALID" : "VOICE_PROFILE_MISSING",
+    canonical.state === "invalid"
+      ? "목소리 프로필이 유효하지 않습니다. 설정에서 다시 등록해 주세요."
+      : "내 목소리만 기록하려면 설정에서 먼저 목소리를 등록해 주세요."
+  );
 }
 const maxAudioBytes = 25 * 1024 * 1024;
 const upload = multer({
@@ -306,6 +328,8 @@ const speakerEnrollmentRateLimit = rateLimit("speaker-enrollment", { limit: 12, 
 const speakerIdentificationRateLimit = rateLimit("speaker-identification", { limit: 30, windowMs: 60 * 60_000 }, (request) =>
   `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
 const knowledgeExplanationRateLimit = rateLimit("knowledge-explanation", { limit: 30, windowMs: 60 * 60_000 }, (request) =>
+  request.auth?.user?.id || request.ip);
+const personalizedTranscriptRateLimit = rateLimit("personalized-transcript", { limit: 600, windowMs: 60 * 60_000 }, (request) =>
   request.auth?.user?.id || request.ip);
 const transcriptionRateLimit = rateLimit("transcription", { limit: 12, windowMs: 60 * 60_000 }, (request) =>
   `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
@@ -408,6 +432,7 @@ function configuredServices() {
     knowledgeFilter: knowledgeFilterService.mode,
     termExtraction: termExtractionService.mode,
     knowledgePersistence: "memory-only",
+    personalizedTranscript: personalizedTranscriptService.mode,
     database: databaseMode,
     speakerStorage: speakerStorageMode,
     speakerModel: speakerModelInfo.id,
@@ -804,7 +829,7 @@ app.post("/api/billing/orders", requireTrustedOrigin, requireAuth, requireOrgani
       orderId: order.orderId,
       planId: order.planId,
       amount: order.amount,
-      orderName: `SSU-ON ${order.planId} 30일 이용권`,
+      orderName: `ConThink ${order.planId} 30일 이용권`,
       expiresAt: order.expiresAt
     });
   });
@@ -837,23 +862,6 @@ app.post("/api/billing/confirm", requireTrustedOrigin, requireAuth, requireOrgan
       throw error;
     }
   });
-
-app.get("/api/organizations/suggestion", requireAuth, async (request, response) => {
-  response.json({ suggestion: await authStore.organizationSuggestion(request.auth.user.id) });
-});
-
-app.post("/api/organizations", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
-  response.status(201).json(await authStore.createOrganization(request.auth.user.id, request.body || {}));
-});
-
-app.post("/api/organizations/join", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
-  response.json(await authStore.joinOrganization(request.auth.user.id, request.body?.inviteCode));
-});
-
-app.get("/api/organizations/current/members", requireAuth, requireOrganization, async (request, response) => {
-  const members = await authStore.listMembers(request.auth.user.id, request.auth.organization.id);
-  response.json({ organization: request.auth.organization, members });
-});
 
 app.put("/api/profile", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
   response.json({ authenticated: true, ...await authStore.updateProfile(request.auth.user.id, request.body || {}) });
@@ -945,6 +953,62 @@ app.get("/api/vocabulary/terms", requireAuth, requireOrganization, async (reques
   response.json({ terms: await personalizedTermsFor(request.auth.user, terms) });
 });
 
+app.post("/api/transcript/translations", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
+  personalizedTranscriptRateLimit, async (request, response) => {
+    const meetingId = String(request.body?.meetingId || "").trim();
+    const requestedSequences = Array.isArray(request.body?.segmentSequences)
+      ? request.body.segmentSequences : [];
+    if (!meetingId || !requestedSequences.length || requestedSequences.length > 12) {
+      return response.status(400).json({ error: "회의와 1~12개의 발화 순서가 필요합니다." });
+    }
+    const segmentSequences = [...new Set(requestedSequences.map(Number))];
+    if (segmentSequences.some((sequence) => !Number.isSafeInteger(sequence) || sequence < 0)) {
+      return response.status(400).json({ error: "발화 순서가 올바르지 않습니다." });
+    }
+    const meeting = await requireMeetingAccess({
+      meetingStore,
+      roomStore,
+      meetingId,
+      auth: request.auth
+    });
+    const positions = new Map(meeting.segments.map((segment, index) => [Number(segment.sequence), { segment, index }]));
+    const selected = segmentSequences.map((sequence) => ({ sequence, ...positions.get(sequence) }))
+      .filter(({ segment }) => segment?.text);
+    const missingSequences = segmentSequences.filter((sequence) => !positions.has(sequence));
+    const introduction = request.auth.user.introduction || "";
+    try {
+      const generated = await personalizedTranscriptService.translate({
+        userId: request.auth.user.id,
+        introduction,
+        items: selected.map(({ sequence, segment }) => ({ id: String(sequence), text: segment.text }))
+      });
+      const generatedBySequence = new Map(generated.translations.map((item) => [Number(item.id), item]));
+      const translations = selected.map((item) => {
+        const personalized = generatedBySequence.get(item.sequence) || {
+          originalText: item.segment.text,
+          personalizedText: item.segment.text,
+          changed: false
+        };
+        return {
+          segmentSequence: item.sequence,
+          originalText: personalized.originalText,
+          personalizedText: personalized.personalizedText,
+          changed: personalized.changed,
+          introductionApplied: Boolean(introduction),
+          source: generated.source,
+          model: generated.model
+        };
+      });
+      return response.status(201).json({ translations, missingSequences });
+    } catch (error) {
+      console.error("Personalized transcript translation failed:", error);
+      return response.status(error?.name === "AbortError" ? 504 : 502).json({
+        error: error?.name === "AbortError"
+          ? "발화 맞춤 번역 시간이 초과되었습니다."
+          : "발화를 내 자기소개에 맞게 번역하지 못했습니다. 잠시 후 다시 시도해 주세요."
+      });
+    }
+  });
 app.post("/api/knowledge/explanations", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
   knowledgeExplanationRateLimit, async (request, response) => {
     const meetingId = String(request.body?.meetingId || "").trim();
@@ -1065,22 +1129,23 @@ app.get("/api/speakers", requireAuth, requireOrganization, async (request, respo
 });
 
 app.post("/api/rooms", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
-  // await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
+  await roomTranscriptProfile(request.auth);
   const room = await roomStore.create({
     organizationId: request.auth.organization.id,
     createdBy: request.auth.user.id,
-    room: request.body?.room,
+    command: request.body?.command,
     idempotencyKey: request.headers["idempotency-key"] || request.body?.idempotencyKey
   });
   response.status(201).json({ room: publicRoom(room, { includeAccessCode: true }) });
 });
 
 app.post("/api/rooms/join", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
-  // await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
+  await roomTranscriptProfile(request.auth);
   const room = await roomStore.join({
     organizationId: request.auth.organization.id,
     userId: request.auth.user.id,
-    accessCode: request.body?.accessCode
+    accessCode: request.body?.accessCode,
+    room: request.body?.room
   });
   response.json({ room: publicRoom(room) });
 });
@@ -1104,7 +1169,7 @@ app.post("/api/rooms/:id/close", requireTrustedOrigin, requireAuth, requireOrgan
 
 app.post("/api/rooms/:id/meetings", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
   const room = await requireRoomMember({ roomStore, roomId: request.params.id, auth: request.auth });
-  // await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
+  await roomTranscriptProfile(request.auth);
   const meeting = await bindRoomMeeting({
     meetingStore,
     room,
@@ -1572,7 +1637,10 @@ app.post("/api/speakers/:id/samples", requireTrustedOrigin, requireAuth, require
       registeredSpeakers.filter(({ id }) => id !== existing.id)
     );
     if (!extension.accepted) return response.status(422).json({ error: extension.reason, comparison: extension });
-    const merged = mergeSpeakerProfileVectors([existing.profiles, additional.vectors], { maximumProfiles: 32 });
+    const merged = mergeSpeakerProfileVectors([existing.profiles, additional.vectors], {
+      maximumProfiles: 32,
+      matchThreshold: speakerModelInfo.defaultMatchThreshold
+    });
     if (merged.consistency < 0.58) return response.status(422).json({ error: "추가 후 목소리 특성의 일관성이 너무 낮아 저장하지 않았습니다." });
     const profileBuffer = Buffer.concat(merged.vectors.map((vector) => Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength)));
     const now = new Date().toISOString();
@@ -1668,14 +1736,13 @@ await Promise.all([
   voiceProfileStore.initialize(), billingStore.initialize(), requestRateLimiter.initialize()
 ]);
 const server = app.listen(port, () => {
-  console.log(`Voice Partition is running at http://localhost:${port}`);
+  console.log(`ConThink is running at http://localhost:${port}`);
 });
-// 화자 recognition을 다시 켤 때 모델 사전 로드도 함께 복구한다.
-// if (shouldPreloadSpeakerModel) {
-//   prepareSpeakerModel()
-//     .then(() => console.log(JSON.stringify({ level: "info", event: "speaker_model_ready", model: speakerModelInfo.id })))
-//     .catch((error) => console.error(JSON.stringify({ level: "error", event: "speaker_model_failed", message: error.message })));
-// }
+if (shouldPreloadSpeakerModel) {
+  prepareSpeakerModel()
+    .then(() => console.log(JSON.stringify({ level: "info", event: "speaker_model_ready", model: speakerModelInfo.id })))
+    .catch((error) => console.error(JSON.stringify({ level: "error", event: "speaker_model_failed", message: error.message })));
+}
 
 const liveServer = new WebSocketServer({ noServer: true });
 const roomLiveHub = new RoomLiveHub({ termBridgeFactory });

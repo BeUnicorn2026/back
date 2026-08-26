@@ -38,6 +38,15 @@ test("generic meeting lists filter inaccessible room meetings", () => {
   assert.match(route, /filterMeetingsForAccess\(\{ meetings, roomStore, auth: request\.auth \}\)/);
 });
 
+test("personalized transcript translation uses server-authorized meeting text and the signed-in introduction", () => {
+  const route = routeSource('app.post("/api/transcript/translations"', 'app.post("/api/knowledge/explanations"');
+  requiresMeetingAccess(route);
+  assert.match(route, /request\.auth\.user\.introduction/);
+  assert.match(route, /meeting\.segments\.map/);
+  assert.doesNotMatch(route, /request\.body\?\.text/);
+  assert.match(route, /personalizedTranscriptService\.translate/);
+});
+
 test("room transcripts cannot be replaced through generic meeting autosave", () => {
   const route = routeSource('app.patch("/api/meetings/:id"', 'app.delete("/api/meetings/:id"');
   assert.match(route, /existing\.roomId && request\.body\?\.segments !== undefined/);
