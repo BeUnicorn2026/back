@@ -48,7 +48,7 @@ import { KnowledgeFilterService, personalizeKnowledgeTerms } from "./lib/knowled
 import { TermExtractionService } from "./lib/term-extraction.mjs";
 import { createNoopTermLiveBridge, createTermLiveBridge } from "./lib/term-live-bridge.mjs";
 import { KnowledgeExplanationService, knowledgeExplanationCacheKey } from "./lib/knowledge-explanation.mjs";
-import { PersonalizedTranscriptService } from "./lib/personalized-transcript.mjs";
+import { PersonalizedTranscriptService, translateTranscriptForViewer } from "./lib/personalized-transcript.mjs";
 import { normalizeUploadFilename, uploadTitle } from "./lib/upload-filename.mjs";
 import { productionEnvironmentIssues, serviceReadiness } from "./lib/service-readiness.mjs";
 import { createConcurrencyLimit } from "./lib/concurrency-limit.mjs";
@@ -977,26 +977,34 @@ app.post("/api/transcript/translations", requireTrustedOrigin, requireAuth, requ
     const missingSequences = segmentSequences.filter((sequence) => !positions.has(sequence));
     const introduction = request.auth.user.introduction || "";
     try {
-      const generated = await personalizedTranscriptService.translate({
+      const generated = await translateTranscriptForViewer({
+        service: personalizedTranscriptService,
         userId: request.auth.user.id,
         introduction,
-        items: selected.map(({ sequence, segment }) => ({ id: String(sequence), text: segment.text }))
+        items: selected.map(({ sequence, segment }) => ({
+          id: String(sequence),
+          text: segment.text,
+          speakerUserId: segment.userId
+        }))
       });
-      const generatedBySequence = new Map(generated.translations.map((item) => [Number(item.id), item]));
+      const generatedBySequence = new Map(generated.map((item) => [Number(item.id), item]));
       const translations = selected.map((item) => {
         const personalized = generatedBySequence.get(item.sequence) || {
           originalText: item.segment.text,
           personalizedText: item.segment.text,
-          changed: false
+          changed: false,
+          introductionApplied: false,
+          source: "raw",
+          model: null
         };
         return {
           segmentSequence: item.sequence,
           originalText: personalized.originalText,
           personalizedText: personalized.personalizedText,
           changed: personalized.changed,
-          introductionApplied: Boolean(introduction),
-          source: generated.source,
-          model: generated.model
+          introductionApplied: personalized.introductionApplied,
+          source: personalized.source,
+          model: personalized.model
         };
       });
       return response.status(201).json({ translations, missingSequences });

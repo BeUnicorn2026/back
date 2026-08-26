@@ -2,8 +2,56 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   PersonalizedTranscriptService,
-  personalizedTranscriptCacheKey
+  personalizedTranscriptCacheKey,
+  translateTranscriptForViewer
 } from "../lib/personalized-transcript.mjs";
+
+test("viewer speech stays raw and never reaches the translation service", async () => {
+  let calls = 0;
+  const translations = await translateTranscriptForViewer({
+    service: { async translate() { calls += 1; throw new Error("must not be called"); } },
+    userId: "viewer",
+    introduction: "디자이너입니다.",
+    items: [{ id: "1", text: "  내가 말한 STT 원문  ", speakerUserId: "viewer" }]
+  });
+  assert.equal(calls, 0);
+  assert.deepEqual(translations, [{
+    id: "1",
+    originalText: "  내가 말한 STT 원문  ",
+    personalizedText: "  내가 말한 STT 원문  ",
+    changed: false,
+    introductionApplied: false,
+    source: "raw",
+    model: null
+  }]);
+});
+
+test("only other speakers are sent through personalized translation", async () => {
+  let received;
+  const translations = await translateTranscriptForViewer({
+    service: {
+      async translate(input) {
+        received = input;
+        return {
+          source: "openai",
+          model: "test-model",
+          translations: [{
+            id: "2", originalText: "DB입니다.", personalizedText: "데이터 저장 공간입니다.", changed: true
+          }]
+        };
+      }
+    },
+    userId: "viewer",
+    introduction: "디자이너입니다.",
+    items: [
+      { id: "1", text: "내 말", speakerUserId: "viewer" },
+      { id: "2", text: "DB입니다.", speakerUserId: "other" }
+    ]
+  });
+  assert.deepEqual(received.items, [{ id: "2", text: "DB입니다." }]);
+  assert.equal(translations[0].source, "raw");
+  assert.equal(translations[1].personalizedText, "데이터 저장 공간입니다.");
+});
 
 test("personalized transcript cache is stable and changes with the learner introduction", () => {
   const base = { text: "DB에 저장해 주세요.", model: "openai:test" };

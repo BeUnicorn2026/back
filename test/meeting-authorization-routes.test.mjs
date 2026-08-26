@@ -44,7 +44,8 @@ test("personalized transcript translation uses server-authorized meeting text an
   assert.match(route, /request\.auth\.user\.introduction/);
   assert.match(route, /meeting\.segments\.map/);
   assert.doesNotMatch(route, /request\.body\?\.text/);
-  assert.match(route, /personalizedTranscriptService\.translate/);
+  assert.match(route, /translateTranscriptForViewer/);
+  assert.match(route, /speakerUserId: segment\.userId/);
 });
 
 test("room transcripts cannot be replaced through generic meeting autosave", () => {
