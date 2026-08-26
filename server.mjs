@@ -46,6 +46,8 @@ import { PcmHistoryBuffer } from "./lib/pcm-history-buffer.mjs";
 import { buildSttKeyterms } from "./lib/stt-keyterms.mjs";
 import { conceptIdFor, normalizeConceptLabel } from "./lib/concept-label.mjs";
 import { KnowledgeFilterService, personalizeKnowledgeTerms } from "./lib/knowledge-personalization.mjs";
+import { TermExtractionService } from "./lib/term-extraction.mjs";
+import { createNoopTermLiveBridge, createTermLiveBridge } from "./lib/term-live-bridge.mjs";
 import { KnowledgeExplanationService, knowledgeExplanationCacheKey } from "./lib/knowledge-explanation.mjs";
 import { normalizeUploadFilename, uploadTitle } from "./lib/upload-filename.mjs";
 import { productionEnvironmentIssues, serviceReadiness } from "./lib/service-readiness.mjs";
@@ -153,6 +155,20 @@ const knowledgeFilterService = new KnowledgeFilterService({
   apiKey: process.env.OPENAI_API_KEY,
   model: process.env.OPENAI_FILTER_MODEL || process.env.OPENAI_EXPLANATION_MODEL || process.env.OPENAI_ANALYSIS_MODEL
 });
+const termExtractionService = new TermExtractionService({
+  apiKey: process.env.OPENAI_API_KEY,
+  model: process.env.OPENAI_TERMS_MODEL || process.env.OPENAI_ANALYSIS_MODEL
+});
+// 실시간 용어 푸시: OpenAI 키가 없으면 브리지를 아예 만들지 않아 오버헤드가 0이다.
+const termBridgeFactory = termExtractionService.mode === "openai"
+  ? ({ participants, meetingTopic, log }) => createTermLiveBridge({
+    extraction: termExtractionService,
+    filter: knowledgeFilterService,
+    participants,
+    meetingTopic,
+    log
+  })
+  : null;
 const tossPayments = new TossPaymentsClient({
   clientKey: process.env.TOSS_CLIENT_KEY,
   secretKey: process.env.TOSS_SECRET_KEY
@@ -390,6 +406,7 @@ function configuredServices() {
     meetingIntelligence: meetingIntelligenceService.mode,
     knowledgeExplanation: knowledgeExplanationService.mode,
     knowledgeFilter: knowledgeFilterService.mode,
+    termExtraction: termExtractionService.mode,
     knowledgePersistence: "memory-only",
     database: databaseMode,
     speakerStorage: speakerStorageMode,
@@ -1660,7 +1677,7 @@ const server = app.listen(port, () => {
 // }
 
 const liveServer = new WebSocketServer({ noServer: true });
-const roomLiveHub = new RoomLiveHub();
+const roomLiveHub = new RoomLiveHub({ termBridgeFactory });
 
 server.on("upgrade", (request, socket, head) => {
   const requestUrl = new URL(request.url, `http://${request.headers.host}`);
@@ -1697,6 +1714,12 @@ liveServer.on("connection", async (client, request, requestUrl) => {
         roomId: room.id,
         meetingId: meeting.id,
         client,
+        meetingTopic: meeting.title || "",
+        participant: {
+          userId: auth.user.id,
+          introduction: auth.user.introduction || "",
+          knownTerms: auth.user.vocabulary?.knownTerms || []
+        },
         loadPersistedSegments: async () => {
           const persisted = await meetingStore.get(meeting.id, auth.organization.id);
           return persisted?.segments || [];
@@ -1772,6 +1795,7 @@ liveServer.on("connection", async (client, request, requestUrl) => {
   // (registered outside the try below) can always dispose it. Defaults to a
   // no-op so a pre-auth failure never leaves it undefined.
   let liveMapBridge = createNoopLiveMapBridge();
+  let termLiveBridge = createNoopTermLiveBridge();
   let liveMapMeetingId = null;
   try {
     const auth = await authStore.getContextBySession(sessionToken(request));
@@ -1793,6 +1817,21 @@ liveServer.on("connection", async (client, request, requestUrl) => {
         meetingId: null,
         log: (entry) => console.log(JSON.stringify({ level: "info", ...entry })),
         pollIntervalMs: Number(process.env.LIVEMAP_POLL_INTERVAL_MS) || 1_000
+      });
+    }
+    if (termBridgeFactory) {
+      // 단독 녹음 경로는 참가자가 녹음자 한 명뿐인 회의방과 같다.
+      termLiveBridge = termBridgeFactory({
+        meetingTopic: "",
+        participants: () => [{
+          userId: auth.user.id,
+          introduction: auth.user.introduction || "",
+          knownTerms: auth.user.vocabulary?.knownTerms || [],
+          send: (payload) => {
+            if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(payload));
+          }
+        }],
+        log: (entry) => console.log(JSON.stringify({ level: "info", ...entry }))
       });
     }
     let preparationTimer = null;
@@ -1900,6 +1939,10 @@ liveServer.on("connection", async (client, request, requestUrl) => {
       finalizationAcknowledged = true;
       clearTimeout(finalizeFallback);
       transcriptQueue.finally(async () => {
+        // Flush the term bridge (마지막 청크의 용어까지 추출·푸시). Best effort.
+        try {
+          await termLiveBridge.finalize();
+        } catch { /* never block finalization */ }
         // Flush the livemap bridge (posts the last turn, finalizes the Go
         // session). All failure paths return null — never block finalization.
         let liveMapFinal = null;
@@ -2000,7 +2043,10 @@ liveServer.on("connection", async (client, request, requestUrl) => {
             client.send(JSON.stringify({ type: "transcript", isFinal: Boolean(event.is_final), speechFinal: Boolean(event.speech_final), segments }));
           }
           if (event.is_final) {
-            for (const segment of segments) liveMapBridge.handleFinalSegment(segment);
+            for (const segment of segments) {
+              liveMapBridge.handleFinalSegment(segment);
+              termLiveBridge.handleFinalSegment(segment);
+            }
           }
           const earliestNeeded = Number(event.start ?? 0) - 4;
           while (recognitionFrames.length && recognitionFrames[0].end < earliestNeeded) recognitionFrames.shift();
@@ -2102,6 +2148,7 @@ liveServer.on("connection", async (client, request, requestUrl) => {
   client.on("close", () => {
     clearTimeout(finalizeFallback);
     liveMapBridge.dispose();
+    termLiveBridge.dispose();
     providerKeepAlive?.stop();
     if (deepgram?.readyState === WebSocket.OPEN) {
       deepgram.send(JSON.stringify({ type: "CloseStream" }));
