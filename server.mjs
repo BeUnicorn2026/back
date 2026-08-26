@@ -47,7 +47,7 @@ import { buildSttKeyterms } from "./lib/stt-keyterms.mjs";
 import { KnowledgeStore } from "./lib/knowledge-store.mjs";
 import { PostgresKnowledgeStore } from "./lib/postgres-knowledge-store.mjs";
 import { knowledgeTwinDefaults, normalizeConceptLabel } from "./lib/knowledge-twin.mjs";
-import { personalizeKnowledgeTerms } from "./lib/knowledge-personalization.mjs";
+import { KnowledgeFilterService, personalizeKnowledgeTerms } from "./lib/knowledge-personalization.mjs";
 import { KnowledgeExplanationService, knowledgeExplanationCacheKey } from "./lib/knowledge-explanation.mjs";
 import { normalizeUploadFilename, uploadTitle } from "./lib/upload-filename.mjs";
 import { productionEnvironmentIssues, serviceReadiness } from "./lib/service-readiness.mjs";
@@ -153,6 +153,10 @@ const goLiveMapClient = new GoLiveMapClient({
 const knowledgeExplanationService = new KnowledgeExplanationService({
   apiKey: process.env.OPENAI_API_KEY,
   model: process.env.OPENAI_EXPLANATION_MODEL || process.env.OPENAI_ANALYSIS_MODEL
+});
+const knowledgeFilterService = new KnowledgeFilterService({
+  apiKey: process.env.OPENAI_API_KEY,
+  model: process.env.OPENAI_FILTER_MODEL || process.env.OPENAI_EXPLANATION_MODEL || process.env.OPENAI_ANALYSIS_MODEL
 });
 const tossPayments = new TossPaymentsClient({
   clientKey: process.env.TOSS_CLIENT_KEY,
@@ -392,6 +396,7 @@ function configuredServices() {
     email: emailService.mode,
     meetingIntelligence: meetingIntelligenceService.mode,
     knowledgeExplanation: knowledgeExplanationService.mode,
+    knowledgeFilter: knowledgeFilterService.mode,
     database: databaseMode,
     speakerStorage: speakerStorageMode,
     speakerModel: speakerModelInfo.id,
@@ -479,8 +484,12 @@ function publicSpeakerProfile(speaker) {
 
 async function personalizedTermsFor(user, terms) {
   const knownTerms = user.vocabulary?.knownTerms || [];
-  const states = await knowledgeStore.statesForTerms(user.id, terms.map(({ term }) => term), knownTerms);
-  return personalizeKnowledgeTerms(terms, states);
+  const { familiarKeys, source } = await knowledgeFilterService.familiarTerms({
+    userId: user.id,
+    introduction: user.introduction || "",
+    candidateTerms: terms.map(({ term }) => term)
+  });
+  return personalizeKnowledgeTerms(terms, { familiarKeys, knownTerms, source });
 }
 
 async function personalizedIntelligenceFor(user, intelligence) {
