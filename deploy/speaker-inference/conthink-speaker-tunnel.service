@@ -1,0 +1,14 @@
+[Unit]
+Description=ConThink private speaker inference tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/ssh -i %h/.ssh/conthink_speaker_tunnel -p 2201 -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new dlwjdgns13579@100.118.236.102 /home/dlwjdgns13579/conthink-speaker-inference/ensure-running.sh
+ExecStart=/usr/bin/ssh -NT -i %h/.ssh/conthink_speaker_tunnel -p 2201 -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -L 127.0.0.1:8710:127.0.0.1:8710 dlwjdgns13579@100.118.236.102
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

@@ -186,7 +186,7 @@ func (c *OpenRouterCaller) httpOnce(ctx context.Context, body []byte) (string, b
 	}
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-OpenRouter-Title", "Voice Partition")
+	req.Header.Set("X-OpenRouter-Title", "ConThink")
 	if c.Referer != "" {
 		req.Header.Set("HTTP-Referer", c.Referer)
 	}

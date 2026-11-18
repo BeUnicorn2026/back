@@ -33,7 +33,7 @@ test("signup, session, organization creation and vocabulary persist", async () =
 
     const session = await store.createSession(user.id);
     const sessionContext = await store.getContextBySession(session.token);
-    assert.equal(sessionContext.organization, null);
+    assert.equal(sessionContext.organization.name, "Unithon");
     assert.equal(sessionContext.csrfToken, session.csrfToken);
     assert.ok(session.csrfToken.length >= 40);
 
@@ -112,10 +112,13 @@ test("signup introduction is required, profile updates are trimmed, and legacy n
     const user = await store.signup({
       name: "소개 사용자", email: "introduction@example.com", password: "secure-pass", introduction: "첫 소개"
     });
-    const updated = await store.updateProfile(user.id, { introduction: "  갱신한 소개  " });
+    const updated = await store.updateProfile(user.id, { name: "  새 이름  ", introduction: "  갱신한 소개  " });
+    assert.equal(updated.user.name, "새 이름");
     assert.equal(updated.user.introduction, "갱신한 소개");
     await assert.rejects(store.updateProfile(user.id, { introduction: "  " }),
       (error) => error instanceof AuthError && error.code === "INTRODUCTION_INVALID");
+    await assert.rejects(store.updateProfile(user.id, { name: " ", introduction: "유효한 소개" }),
+      (error) => error instanceof AuthError && error.code === "NAME_INVALID");
   });
 });
 

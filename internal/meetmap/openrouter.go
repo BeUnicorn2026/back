@@ -136,7 +136,7 @@ func (client *OpenRouter) analyzeOnce(ctx context.Context, body []byte, segmentC
 	}
 	req.Header.Set("Authorization", "Bearer "+client.APIKey)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-OpenRouter-Title", "Voice Partition")
+	req.Header.Set("X-OpenRouter-Title", "ConThink")
 	if client.Referer != "" {
 		req.Header.Set("HTTP-Referer", client.Referer)
 	}

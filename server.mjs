@@ -31,7 +31,6 @@ import {
   bindRoomMeeting,
   publicRoom,
   publishSelfEnrollment,
-  requireCanonicalVoice,
   requireRoomMember,
   resolveCanonicalVoice,
   roomErrorHttpStatus,
@@ -49,6 +48,7 @@ import { PostgresKnowledgeStore } from "./lib/postgres-knowledge-store.mjs";
 import { knowledgeTwinDefaults, normalizeConceptLabel } from "./lib/knowledge-twin.mjs";
 import { personalizeKnowledgeTerms } from "./lib/knowledge-personalization.mjs";
 import { KnowledgeExplanationService, knowledgeExplanationCacheKey } from "./lib/knowledge-explanation.mjs";
+import { PersonalizedTranscriptService, personalizedTranscriptCacheKey, translateTranscriptForViewer } from "./lib/personalized-transcript.mjs";
 import { normalizeUploadFilename, uploadTitle } from "./lib/upload-filename.mjs";
 import { productionEnvironmentIssues, serviceReadiness } from "./lib/service-readiness.mjs";
 import { createConcurrencyLimit } from "./lib/concurrency-limit.mjs";
@@ -154,25 +154,36 @@ const knowledgeExplanationService = new KnowledgeExplanationService({
   apiKey: process.env.OPENAI_API_KEY,
   model: process.env.OPENAI_EXPLANATION_MODEL || process.env.OPENAI_ANALYSIS_MODEL
 });
+const personalizedTranscriptService = new PersonalizedTranscriptService({
+  apiKey: process.env.OPENAI_API_KEY,
+  model: process.env.OPENAI_EXPLANATION_MODEL || process.env.OPENAI_ANALYSIS_MODEL
+});
 const tossPayments = new TossPaymentsClient({
   clientKey: process.env.TOSS_CLIENT_KEY,
   secretKey: process.env.TOSS_SECRET_KEY
 });
 const speakerModelCache = process.env.SPEAKER_MODEL_CACHE || path.join(projectDirectory, ".cache", "speaker-models");
 const speakerModelPath = process.env.SPEAKER_MODEL_PATH || "";
-// 화자 recognition 모델은 판정 품질을 다시 검증할 때까지 비활성화한다.
-// const speakerRecognitionEnabled = process.env.SPEAKER_RECOGNITION_ENABLED !== "false";
-// const shouldPreloadSpeakerModel = process.env.PRELOAD_SPEAKER_MODEL === "true"
-//   || (process.env.NODE_ENV === "production" && process.env.PRELOAD_SPEAKER_MODEL !== "false");
-const speakerRecognitionEnabled = false;
-const shouldPreloadSpeakerModel = false;
-let speakerModelState = "disabled";
+const speakerInferenceOrigin = process.env.SPEAKER_INFERENCE_ORIGIN || "";
+const speakerInferenceTokenFile = process.env.SPEAKER_INFERENCE_TOKEN_FILE || "";
+const speakerRecognitionEnabled = process.env.SPEAKER_RECOGNITION_ENABLED === "true";
+const shouldPreloadSpeakerModel = speakerRecognitionEnabled && (
+  process.env.PRELOAD_SPEAKER_MODEL === "true"
+  || (process.env.NODE_ENV === "production" && process.env.PRELOAD_SPEAKER_MODEL !== "false")
+);
+let speakerModelState = speakerRecognitionEnabled ? "idle" : "disabled";
 let speakerModelFailure = null;
 
 async function prepareSpeakerModel() {
   if (speakerModelState !== "ready") speakerModelState = "loading";
   try {
-    const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath);
+    const model = await getSpeakerEmbeddingModel(speakerModelCache, speakerModelPath, {
+      origin: speakerInferenceOrigin,
+      token: process.env.SPEAKER_INFERENCE_TOKEN,
+      tokenFile: speakerInferenceTokenFile,
+      dimensions: speakerModelInfo.dimensions,
+      matchThreshold: speakerModelInfo.defaultMatchThreshold
+    });
     speakerModelState = "ready";
     speakerModelFailure = null;
     return model;
@@ -196,12 +207,29 @@ function transcriptProfileForCurrentUser(auth) {
 }
 
 async function roomTranscriptProfile(auth) {
-  // 화자 recognition을 다시 켤 때만 회의 입장 전에 등록 프로필을 요구한다.
-  // return (await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth })).profile;
-  if (speakerRecognitionEnabled) {
-    return (await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth })).profile;
+  if (!speakerRecognitionEnabled) return transcriptProfileForCurrentUser(auth);
+  const canonical = await resolveCanonicalVoice({ voiceProfileStore, speakerStore, auth });
+  if (canonical.state === "ready") {
+    return speakerProfileNeedsMigration(canonical.profile, speakerModelInfo)
+      ? migrateOwnedSpeakerProfile(canonical.profile, auth)
+      : canonical.profile;
   }
-  return transcriptProfileForCurrentUser(auth);
+  const legacyOwnedProfile = (await loadCurrentSpeakerProfiles(auth.organization.id))
+    .find((profile) => profile.createdBy === auth.user.id);
+  if (legacyOwnedProfile) {
+    return {
+      ...legacyOwnedProfile,
+      userId: auth.user.id,
+      speakerProfileId: legacyOwnedProfile.id,
+      displayName: auth.user.name
+    };
+  }
+  throw new VoiceProfileError(
+    canonical.state === "invalid" ? "VOICE_PROFILE_INVALID" : "VOICE_PROFILE_MISSING",
+    canonical.state === "invalid"
+      ? "목소리 프로필이 유효하지 않습니다. 설정에서 다시 등록해 주세요."
+      : "내 목소리만 기록하려면 설정에서 먼저 목소리를 등록해 주세요."
+  );
 }
 const maxAudioBytes = 25 * 1024 * 1024;
 const upload = multer({
@@ -293,6 +321,8 @@ const speakerIdentificationRateLimit = rateLimit("speaker-identification", { lim
 const knowledgeEvidenceRateLimit = rateLimit("knowledge-evidence", { limit: 240, windowMs: 60 * 60_000 }, (request) =>
   request.auth?.user?.id || request.ip);
 const knowledgeExplanationRateLimit = rateLimit("knowledge-explanation", { limit: 30, windowMs: 60 * 60_000 }, (request) =>
+  request.auth?.user?.id || request.ip);
+const personalizedTranscriptRateLimit = rateLimit("personalized-transcript", { limit: 600, windowMs: 60 * 60_000 }, (request) =>
   request.auth?.user?.id || request.ip);
 const transcriptionRateLimit = rateLimit("transcription", { limit: 12, windowMs: 60 * 60_000 }, (request) =>
   `${request.auth?.organization?.id || "none"}:${request.auth?.user?.id || request.ip}`);
@@ -392,6 +422,7 @@ function configuredServices() {
     email: emailService.mode,
     meetingIntelligence: meetingIntelligenceService.mode,
     knowledgeExplanation: knowledgeExplanationService.mode,
+    personalizedTranscript: personalizedTranscriptService.mode,
     database: databaseMode,
     speakerStorage: speakerStorageMode,
     speakerModel: speakerModelInfo.id,
@@ -515,6 +546,22 @@ function publicKnowledgeExplanation(stored) {
     };
   }
   return explanation;
+}
+
+function publicPersonalizedTranscript(stored) {
+  return {
+    cacheKey: stored.cacheKey,
+    meetingId: stored.meetingId,
+    segmentIndex: stored.segmentIndex,
+    segmentSequence: stored.result.segmentSequence,
+    originalText: stored.result.originalText,
+    personalizedText: stored.result.personalizedText,
+    changed: Boolean(stored.result.changed),
+    introductionApplied: Boolean(stored.result.introductionApplied),
+    source: stored.source,
+    model: stored.model,
+    generatedAt: stored.createdAt
+  };
 }
 
 function pcmToWave(pcm, sampleRate = 16_000) {
@@ -650,6 +697,48 @@ async function enrollProfile(pcm) {
 }
 
 const speakerProfileMigrationPromises = new Map();
+
+async function migrateOwnedSpeakerProfile(profile, auth) {
+  let migration = speakerProfileMigrationPromises.get(profile.id);
+  if (!migration) {
+    migration = (async () => {
+      const model = await prepareSpeakerModel();
+      await migrateSpeakerProfiles([profile], {
+        model,
+        modelInfo: speakerModelInfo,
+        decodeReference: async (referenceAudio) => {
+          const decoded = await decodeToPcm(referenceAudio);
+          return new Int16Array(decoded.buffer, decoded.byteOffset, Math.floor(decoded.byteLength / 2));
+        },
+        replace: async (metadata, profileBuffer, referenceAudio) => {
+          const replaced = await speakerStore.replaceOwned(
+            metadata, profileBuffer, referenceAudio, auth.user.id
+          );
+          if (!replaced) throw new Error("소유한 목소리 프로필만 갱신할 수 있습니다.");
+        }
+      });
+      const updated = await speakerStore.loadOwnedProfile(profile.id, auth.user.id);
+      if (speakerProfileNeedsMigration(updated, speakerModelInfo)) {
+        throw new Error("목소리 프로필 모델 갱신을 확인하지 못했습니다.");
+      }
+      console.log(JSON.stringify({
+        level: "info",
+        event: "owned_speaker_profile_migrated",
+        userId: auth.user.id,
+        speakerProfileId: profile.id,
+        model: speakerModelInfo.id
+      }));
+      return {
+        ...updated,
+        userId: auth.user.id,
+        speakerProfileId: updated.id,
+        displayName: auth.user.name
+      };
+    })().finally(() => speakerProfileMigrationPromises.delete(profile.id));
+    speakerProfileMigrationPromises.set(profile.id, migration);
+  }
+  return migration;
+}
 
 async function loadCurrentSpeakerProfiles(organizationId) {
   const speakers = await speakerStore.loadProfiles(organizationId);
@@ -789,7 +878,7 @@ app.post("/api/billing/orders", requireTrustedOrigin, requireAuth, requireOrgani
       orderId: order.orderId,
       planId: order.planId,
       amount: order.amount,
-      orderName: `SSU-ON ${order.planId} 30일 이용권`,
+      orderName: `ConThink ${order.planId} 30일 이용권`,
       expiresAt: order.expiresAt
     });
   });
@@ -822,23 +911,6 @@ app.post("/api/billing/confirm", requireTrustedOrigin, requireAuth, requireOrgan
       throw error;
     }
   });
-
-app.get("/api/organizations/suggestion", requireAuth, async (request, response) => {
-  response.json({ suggestion: await authStore.organizationSuggestion(request.auth.user.id) });
-});
-
-app.post("/api/organizations", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
-  response.status(201).json(await authStore.createOrganization(request.auth.user.id, request.body || {}));
-});
-
-app.post("/api/organizations/join", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
-  response.json(await authStore.joinOrganization(request.auth.user.id, request.body?.inviteCode));
-});
-
-app.get("/api/organizations/current/members", requireAuth, requireOrganization, async (request, response) => {
-  const members = await authStore.listMembers(request.auth.user.id, request.auth.organization.id);
-  response.json({ organization: request.auth.organization, members });
-});
 
 app.put("/api/profile", requireTrustedOrigin, requireAuth, requireCsrf, async (request, response) => {
   response.json({ authenticated: true, ...await authStore.updateProfile(request.auth.user.id, request.body || {}) });
@@ -952,6 +1024,106 @@ app.get("/api/knowledge", requireAuth, async (request, response) => {
   const concepts = new Map([...priors, ...stored].map((state) => [state.conceptId, state]));
   response.json({ concepts: [...concepts.values()] });
 });
+
+app.post("/api/transcript/translations", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
+  personalizedTranscriptRateLimit, async (request, response) => {
+    const meetingId = String(request.body?.meetingId || "").trim();
+    const requestedSequences = Array.isArray(request.body?.segmentSequences)
+      ? request.body.segmentSequences : [];
+    if (!meetingId || !requestedSequences.length || requestedSequences.length > 12) {
+      return response.status(400).json({ error: "회의와 1~12개의 발화 순서가 필요합니다." });
+    }
+    const segmentSequences = [...new Set(requestedSequences.map(Number))];
+    if (segmentSequences.some((sequence) => !Number.isSafeInteger(sequence) || sequence < 0)) {
+      return response.status(400).json({ error: "발화 순서가 올바르지 않습니다." });
+    }
+    const meeting = await requireMeetingAccess({
+      meetingStore,
+      roomStore,
+      meetingId,
+      auth: request.auth
+    });
+    const positions = new Map(meeting.segments.map((segment, index) => [Number(segment.sequence), { segment, index }]));
+    const selected = segmentSequences.map((sequence) => ({ sequence, ...positions.get(sequence) }))
+      .filter(({ segment }) => segment?.text);
+    const missingSequences = segmentSequences.filter((sequence) => !positions.has(sequence));
+    const introduction = request.auth.user.introduction || "";
+    const modelKey = `${personalizedTranscriptService.mode}:${personalizedTranscriptService.model}`;
+    const ownSpeech = selected.filter(({ segment }) => String(segment.userId || "") === request.auth.user.id);
+    const translations = ownSpeech.map((item) => ({
+      meetingId: meeting.id,
+      segmentIndex: item.index,
+      segmentSequence: item.sequence,
+      originalText: item.segment.text,
+      personalizedText: item.segment.text,
+      changed: false,
+      introductionApplied: false,
+      source: "raw",
+      model: null
+    }));
+    const uncached = [];
+
+    for (const item of selected) {
+      if (String(item.segment.userId || "") === request.auth.user.id) continue;
+      const cacheKey = personalizedTranscriptCacheKey({
+        text: item.segment.text,
+        introduction,
+        model: modelKey
+      });
+      const cached = await knowledgeStore.getExplanation(request.auth.user.id, cacheKey);
+      if (cached) translations.push(publicPersonalizedTranscript(cached));
+      else uncached.push({ ...item, cacheKey });
+    }
+
+    if (uncached.length) {
+      try {
+        const generated = await translateTranscriptForViewer({
+          service: personalizedTranscriptService,
+          userId: request.auth.user.id,
+          introduction,
+          items: uncached.map(({ sequence, segment }) => ({
+            id: String(sequence), text: segment.text, speakerUserId: segment.userId
+          }))
+        });
+        const generatedBySequence = new Map(generated.map((item) => [Number(item.id), item]));
+        for (const item of uncached) {
+          const personalized = generatedBySequence.get(item.sequence) || {
+            originalText: item.segment.text,
+            personalizedText: item.segment.text,
+            changed: false
+          };
+          const stored = await knowledgeStore.saveExplanation({
+            userId: request.auth.user.id,
+            cacheKey: item.cacheKey,
+            conceptLabel: "발화 맞춤 번역",
+            level: "transcript",
+            result: {
+              segmentSequence: item.sequence,
+              originalText: personalized.originalText,
+              personalizedText: personalized.personalizedText,
+              changed: personalized.changed,
+              introductionApplied: personalized.introductionApplied
+            },
+            source: personalized.source,
+            model: personalized.model,
+            meetingId: meeting.id,
+            segmentIndex: item.index
+          });
+          translations.push(publicPersonalizedTranscript(stored));
+        }
+      } catch (error) {
+        console.error("Personalized transcript translation failed:", error);
+        return response.status(error?.name === "AbortError" ? 504 : 502).json({
+          error: error?.name === "AbortError"
+            ? "발화 맞춤 번역 시간이 초과되었습니다."
+            : "발화를 내 자기소개에 맞게 번역하지 못했습니다. 잠시 후 다시 시도해 주세요."
+        });
+      }
+    }
+
+    translations.sort((left, right) => left.segmentSequence - right.segmentSequence);
+    return response.status(uncached.length ? 201 : 200).json({ translations, missingSequences });
+  });
 
 app.post("/api/knowledge/evidence", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf,
   knowledgeEvidenceRateLimit, async (request, response) => {
@@ -1165,22 +1337,23 @@ app.get("/api/speakers", requireAuth, requireOrganization, async (request, respo
 });
 
 app.post("/api/rooms", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
-  // await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
+  await roomTranscriptProfile(request.auth);
   const room = await roomStore.create({
     organizationId: request.auth.organization.id,
     createdBy: request.auth.user.id,
-    room: request.body?.room,
+    command: request.body?.command,
     idempotencyKey: request.headers["idempotency-key"] || request.body?.idempotencyKey
   });
   response.status(201).json({ room: publicRoom(room, { includeAccessCode: true }) });
 });
 
 app.post("/api/rooms/join", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
-  // await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
+  await roomTranscriptProfile(request.auth);
   const room = await roomStore.join({
     organizationId: request.auth.organization.id,
     userId: request.auth.user.id,
-    accessCode: request.body?.accessCode
+    accessCode: request.body?.accessCode,
+    room: request.body?.room
   });
   response.json({ room: publicRoom(room) });
 });
@@ -1204,7 +1377,7 @@ app.post("/api/rooms/:id/close", requireTrustedOrigin, requireAuth, requireOrgan
 
 app.post("/api/rooms/:id/meetings", requireTrustedOrigin, requireAuth, requireOrganization, requireCsrf, async (request, response) => {
   const room = await requireRoomMember({ roomStore, roomId: request.params.id, auth: request.auth });
-  // await requireCanonicalVoice({ voiceProfileStore, speakerStore, auth: request.auth });
+  await roomTranscriptProfile(request.auth);
   const meeting = await bindRoomMeeting({
     meetingStore,
     room,
@@ -1672,7 +1845,10 @@ app.post("/api/speakers/:id/samples", requireTrustedOrigin, requireAuth, require
       registeredSpeakers.filter(({ id }) => id !== existing.id)
     );
     if (!extension.accepted) return response.status(422).json({ error: extension.reason, comparison: extension });
-    const merged = mergeSpeakerProfileVectors([existing.profiles, additional.vectors], { maximumProfiles: 32 });
+    const merged = mergeSpeakerProfileVectors([existing.profiles, additional.vectors], {
+      maximumProfiles: 32,
+      matchThreshold: speakerModelInfo.defaultMatchThreshold
+    });
     if (merged.consistency < 0.58) return response.status(422).json({ error: "추가 후 목소리 특성의 일관성이 너무 낮아 저장하지 않았습니다." });
     const profileBuffer = Buffer.concat(merged.vectors.map((vector) => Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength)));
     const now = new Date().toISOString();
@@ -1768,14 +1944,13 @@ await Promise.all([
   voiceProfileStore.initialize(), knowledgeStore.initialize(), billingStore.initialize(), requestRateLimiter.initialize()
 ]);
 const server = app.listen(port, () => {
-  console.log(`Voice Partition is running at http://localhost:${port}`);
+  console.log(`ConThink is running at http://localhost:${port}`);
 });
-// 화자 recognition을 다시 켤 때 모델 사전 로드도 함께 복구한다.
-// if (shouldPreloadSpeakerModel) {
-//   prepareSpeakerModel()
-//     .then(() => console.log(JSON.stringify({ level: "info", event: "speaker_model_ready", model: speakerModelInfo.id })))
-//     .catch((error) => console.error(JSON.stringify({ level: "error", event: "speaker_model_failed", message: error.message })));
-// }
+if (shouldPreloadSpeakerModel) {
+  prepareSpeakerModel()
+    .then(() => console.log(JSON.stringify({ level: "info", event: "speaker_model_ready", model: speakerModelInfo.id })))
+    .catch((error) => console.error(JSON.stringify({ level: "error", event: "speaker_model_failed", message: error.message })));
+}
 
 const liveServer = new WebSocketServer({ noServer: true });
 const roomLiveHub = new RoomLiveHub();

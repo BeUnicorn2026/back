@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { getSpeakerEmbeddingModel, speakerInferenceInfo, speakerInferenceWindows, SpeakerEmbeddingModel } from "../lib/speaker-embedding-model.mjs";
+import { getSpeakerEmbeddingModel, RemoteSpeakerEmbeddingModel, speakerInferenceInfo, speakerInferenceWindows, SpeakerEmbeddingModel } from "../lib/speaker-embedding-model.mjs";
 
 test("retries speaker model initialization after a failure instead of caching rejection", async () => {
   const first = getSpeakerEmbeddingModel("/unused", "/definitely-missing/speaker-model-one.onnx");
@@ -9,6 +9,43 @@ test("retries speaker model initialization after a failure instead of caching re
   const second = getSpeakerEmbeddingModel("/unused", "/definitely-missing/speaker-model-two.onnx");
   assert.notStrictEqual(second, first);
   await assert.rejects(second, /speaker-model-two\.onnx/);
+});
+
+test("sends raw PCM to an authenticated remote speaker embedding service", async () => {
+  let request;
+  const model = new RemoteSpeakerEmbeddingModel({
+    origin: "http://127.0.0.1:8710/",
+    token: "test-token",
+    fetchImpl: async (url, options) => {
+      request = { url, options };
+      return new Response(JSON.stringify({ embedding: [1, ...Array(511).fill(0)] }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+  });
+  const pcm = new Int16Array(2 * 16_000).fill(1_000);
+  const embedding = await model.embed(pcm);
+  assert.equal(request.url, "http://127.0.0.1:8710/v1/embeddings");
+  assert.equal(request.options.headers.authorization, "Bearer test-token");
+  assert.equal(request.options.body.byteLength, pcm.byteLength);
+  assert.equal(embedding.length, 512);
+  assert.equal(model.matchThreshold, 0.6);
+});
+
+test("accepts the configured dimensions of a remote verification model", async () => {
+  const model = new RemoteSpeakerEmbeddingModel({
+    origin: "http://127.0.0.1:8710",
+    token: "test-token",
+    dimensions: 256,
+    matchThreshold: 0.45,
+    fetchImpl: async () => new Response(JSON.stringify({
+      embedding: [1, ...Array(255).fill(0)]
+    }), { status: 200, headers: { "content-type": "application/json" } })
+  });
+  const embedding = await model.embed(new Int16Array(2 * 16_000).fill(1_000));
+  assert.equal(embedding.length, 256);
+  assert.equal(model.matchThreshold, 0.45);
 });
 
 test("runs inference for clean speech below the stricter enrollment volume", async () => {

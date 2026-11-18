@@ -1,4 +1,4 @@
-# Voice Partition Backend
+# ConThink Backend
 
 ## Go migration server
 
@@ -40,6 +40,12 @@ All three conditions are required to enable it:
 Internal, bearer-protected, tenant-scoped session endpoints live under `/api/ai/livemap/...`. If Go is unavailable or misconfigured, live captions remain completely unaffected; the live map is simply absent. Session state is held in Go process memory, so a Go restart loses the active live session, but running the batch MeetMap after the meeting can rebuild the tree.
 
 > **PRIVACY AND EXTERNAL-TRANSMISSION WARNING:** With `LIVEMAP_ENABLED=true`, **every finalized speech turn is transmitted to OpenRouter in real time during the meeting** and incurs per-turn usage costs. This integration provides no guaranteed no-retention setting. Do not enable it for meetings whose content must not leave your infrastructure.
+
+## 자기소개 기반 발화 번역
+
+`OPENAI_API_KEY`가 설정되면 인증된 사용자의 프런트엔드는 확정된 발화 순서를 `/api/transcript/translations`에 요청합니다. 서버는 클라이언트가 보낸 임의 문장이 아니라 접근 권한이 확인된 회의 저장 원문과 현재 로그인 사용자의 서버 저장 자기소개만 사용합니다. 결과와 캐시는 사용자별로 분리되므로 같은 `DB` 발화도 디자이너와 백엔드 개발자에게 서로 다른 눈높이로 표시될 수 있습니다. 원문은 회의 기록에 그대로 보존됩니다.
+
+> **개인정보 및 외부 전송 주의:** 이 기능은 각 확정 발화와 요청 사용자의 자기소개를 OpenAI에 자동 전송합니다. `store: false`로 요청하지만, 사용 전 조직의 개인정보·보존 정책과 OpenAI 데이터 처리 조건을 검토해야 합니다. `OPENAI_API_KEY`가 없으면 서버는 원문을 반환합니다.
 
 ## Node compatibility server
 
